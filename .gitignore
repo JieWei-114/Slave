@@ -96,3 +96,5 @@ htmlcov/
 .DS_Store
 *.pem
 *.key
+# runtime-downloaded voice model cache (whisper/piper)
+backend/voice_models/

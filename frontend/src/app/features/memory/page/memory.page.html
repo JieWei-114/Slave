@@ -2,6 +2,15 @@
   <div class="memory-actions">
     <input type="text" placeholder="Search memory..." (input)="onSearch($event.target.value)" />
   </div>
+
+  <app-error-banner
+    [message]="store.error()"
+    [dismissible]="true"
+    (dismiss)="store.clearError()"
+  />
+
+  <div class="memory-loading" *ngIf="store.loading()">Loading memories…</div>
+
   <div class="memory-list">
     <div class="memory-item" *ngFor="let m of store.memories()" [class.disabled]="!m.enabled">
       <label class="memory-checkbox">
@@ -19,10 +28,17 @@
         <span class="tag" *ngIf="m.category === 'other'">Other</span>
       </div>
 
-      <button class="btn-delete" (click)="store.delete(m)" title="Delete memory">🗑</button>
+      <button
+        class="btn-delete"
+        [class.confirming]="confirmingDeleteId === m.id"
+        (click)="requestDelete(m)"
+        [title]="confirmingDeleteId === m.id ? 'Click again to confirm delete' : 'Delete memory'"
+      >
+        {{ confirmingDeleteId === m.id ? 'Delete? ✓' : '🗑' }}
+      </button>
     </div>
 
-    <div class="empty-state" *ngIf="!store.memories().length">
+    <div class="empty-state" *ngIf="!store.memories().length && !store.loading()">
       <h3>No memories yet</h3>
       <p>Add important information to remember</p>
     </div>

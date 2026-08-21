@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -181,7 +182,7 @@ async def _extract_url_content(user_content: str, session_id: str) -> tuple[str,
             text_to_save = extracted[:5000] if settings.MEMORY_MAX_CONTENT_LENGTH else extracted
             await add_synthesized_memory(
                 session_id=session_id,
-                content=text_to_save,
+                fact=text_to_save,
                 source='url_extraction',
                 category='important',
                 confidence=0.9,
@@ -706,11 +707,15 @@ Size: {len(content)} characters
 async def _build_memory_context(session_id: str, query: str, limits: dict) -> dict:
     """Build context from semantic memories."""
     try:
-        important_memories = list_memories_by_category(session_id, 'important')
-        memories = search_memories(
-            chat_sessionId=session_id,
-            query=query,
-            limit=limits.get('memory_items', MEMORY_RESULTS_LIMIT),
+        # Run blocking embedding + Mongo work off the event loop
+        important_memories = await asyncio.to_thread(
+            list_memories_by_category, session_id, 'important'
+        )
+        memories = await asyncio.to_thread(
+            search_memories,
+            session_id,
+            query,
+            limits.get('memory_items', MEMORY_RESULTS_LIMIT),
         )
 
         combined = []
@@ -1113,7 +1118,8 @@ async def stream_chat_reply(
     except Exception as e:
         logger.warning(f'Could not fetch attachments for message: {e}')
 
-    sessions_collection.update_one(
+    await asyncio.to_thread(
+        sessions_collection.update_one,
         {'id': session_id},
         {
             '$push': {'messages': user_msg},
@@ -1184,8 +1190,15 @@ async def stream_chat_reply(
         # Send signal that answer streaming is complete
         yield json.dumps({'type': 'answer_complete'})
     except Exception as e:
+        # Stream failed: notify caller and do NOT persist an assistant message
         logger.error(f'Answer generation failed: {e}')
-        yield json.dumps({'type': 'error', 'message': 'Generation failed'})
+        yield json.dumps({'type': 'error', 'message': f'Generation failed: {e}'})
+        return
+
+    if not assistant_answer.strip():
+        # Model produced no output — treat as failure, do not persist empty message
+        logger.error('Answer generation produced empty output', extra={'session_id': session_id})
+        yield json.dumps({'type': 'error', 'message': 'Generation failed: empty response'})
         return
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1379,7 +1392,8 @@ async def stream_chat_reply(
     }
 
     try:
-        sessions_collection.update_one(
+        await asyncio.to_thread(
+            sessions_collection.update_one,
             {'id': session_id},
             {
                 '$push': {'messages': assistant_msg},

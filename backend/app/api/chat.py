@@ -11,6 +11,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from app.config.ai_models import AVAILABLE_MODELS
 from app.config.constants import HTTP_BAD_REQUEST, HTTP_INTERNAL_ERROR, HTTP_NOT_FOUND
@@ -101,19 +102,26 @@ def get_chat_session(session_id: str):
         raise HTTPException(status_code=HTTP_INTERNAL_ERROR, detail='Failed to retrieve session')
 
 
-@router.get('/{session_id}/stream')
-async def stream_message(
-    session_id: str,
-    content: str,
-    model: str,
-    reasoning: bool = False,
-):
+class StreamMessageRequest(BaseModel):
+    """JSON body for the chat streaming endpoint."""
+
+    content: str
+    model: str
+    reasoning: bool = False
+
+
+@router.post('/{session_id}/stream')
+async def stream_message(session_id: str, payload_in: StreamMessageRequest):
     """
     Stream chat response using Server-Sent Events (SSE).
 
-    Frontend connects via EventSource to receive real-time token streaming.
+    POST with JSON body {content, model, reasoning}; responds with
+    text/event-stream real-time token streaming.
 
     """
+    content = payload_in.content
+    model = payload_in.model
+    reasoning = payload_in.reasoning
     try:
         logger.info(
             f'Streaming message for session {session_id}, content_len={len(content)}, model={model}, reasoning={reasoning}'
@@ -136,20 +144,27 @@ async def stream_message(
 
                     try:
                         payload = json.loads(chunk)
+                        event_type = payload.get('type')
 
-                        if payload.get('type') == 'done':
+                        if event_type == 'done':
                             yield (f'event: done\ndata: {json.dumps(payload)}\n\n')
 
-                        elif payload.get('type') == 'token':
+                        elif event_type == 'token':
                             yield (f'event: token\ndata: {json.dumps(payload["data"])}\n\n')
 
-                        elif payload.get('type') == 'reasoning_token':
+                        elif event_type == 'reasoning_token':
                             yield (
                                 f'event: reasoning_token\ndata: {json.dumps(payload["data"])}\n\n'
                             )
 
-                        elif payload.get('type') == 'error':
+                        elif event_type == 'error':
                             yield (f'event: error\ndata: {json.dumps(payload)}\n\n')
+
+                        elif event_type:
+                            # Generic passthrough for all other event types
+                            # (answer_complete, verification_starting,
+                            # verification_complete, reasoning_starting, ...)
+                            yield (f'event: {event_type}\ndata: {json.dumps(payload)}\n\n')
 
                     except json.JSONDecodeError:
                         # normal token
@@ -183,7 +198,13 @@ def get_messages(session_id: str, limit: int = None, before: Optional[str] = Non
     messages = sorted(messages, key=lambda m: m['created_at'])
 
     if before:
-        before_dt = datetime.fromisoformat(before.replace('Z', ''))
+        try:
+            before_dt = datetime.fromisoformat(before.replace('Z', ''))
+        except ValueError:
+            raise HTTPException(
+                status_code=HTTP_BAD_REQUEST,
+                detail="Invalid 'before' timestamp: must be ISO 8601 format",
+            )
         messages = [m for m in messages if m['created_at'] < before_dt]
 
     return messages[-limit:]
@@ -251,6 +272,15 @@ async def upload_file(file: UploadFile = File(...)):
     """
     try:
         logger.info(f'Uploading file: {file.filename}')
+
+        # Enforce allowed extensions server-side
+        allowed_exts = tuple(ext.lower() for ext in settings.FILE_UPLOAD_ALLOWED_EXTENSIONS)
+        if not (file.filename or '').lower().endswith(allowed_exts):
+            logger.warning(f'File {file.filename} rejected: extension not allowed')
+            raise HTTPException(
+                status_code=HTTP_BAD_REQUEST,
+                detail=f'File type not allowed. Allowed extensions: {", ".join(allowed_exts)}',
+            )
 
         # Read file content
         file_content = await file.read()

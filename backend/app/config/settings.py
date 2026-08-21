@@ -9,16 +9,50 @@ class Settings(BaseSettings):
 
     # DATABASE SETTINGS
     MONGO_URI: Optional[str] = None # Set in .env
-    DB_NAME: Optional[str] = None # Set in .env
+    # NOTE: default DB name renamed from 'myslave' to 'slave' as part of the
+    # MySlave -> Slave rename. Existing deployments should set DB_NAME in .env
+    # to keep pointing at their old database.
+    DB_NAME: str = 'slave' # Override in .env
+
+    # SECURITY SETTINGS
+    # Optional API key. When non-empty, all API requests must include the
+    # X-API-Key header with this value. Empty (default) = auth disabled (local dev).
+    API_KEY: str = ''
 
     # MongoDB connection pool settings
     MONGO_MAX_POOL_SIZE: int = 100
     MONGO_MIN_POOL_SIZE: int = 10
     MONGO_SERVER_SELECTION_TIMEOUT_MS: int = 5000
 
-    # LLM SETTINGS (Ollama)
+    # LLM SETTINGS
+    # Active LLM provider: 'ollama' (default) | 'openai_compat'
+    LLM_PROVIDER: str = 'ollama'
+
+    # Ollama (native API)
     OLLAMA_URL: Optional[str] = None # Set in .env
     OLLAMA_TIMEOUT: int = 120
+
+    # OpenAI-compatible API (vLLM, llama.cpp server, LM Studio, OpenAI)
+    # Base URL without /v1 suffix, e.g. http://localhost:8001
+    OPENAI_COMPAT_BASE_URL: str = ''
+    OPENAI_COMPAT_API_KEY: str = ''  # Sent as Authorization: Bearer when non-empty
+
+    # VECTOR STORE SETTINGS
+    # Active vector store: 'mongo' (default, cosine in Python) | 'qdrant'
+    VECTOR_STORE: str = 'mongo'
+    QDRANT_URL: str = 'http://qdrant:6333'
+    QDRANT_COLLECTION: str = 'slave_memories'
+    # Embedding dimension (all-MiniLM-L6-v2 = 384)
+    EMBEDDING_DIM: int = 384
+
+    # VOICE SETTINGS (local STT + TTS, privacy-first)
+    VOICE_ENABLED: bool = True
+    # faster-whisper model size: tiny | base | small | medium | large-v3
+    WHISPER_MODEL: str = 'base'
+    # Piper voice name, e.g. 'en_US-lessac-medium' ({locale}-{name}-{quality})
+    PIPER_VOICE: str = 'en_US-lessac-medium'
+    # Where whisper + piper model files are downloaded/cached
+    VOICE_MODELS_DIR: str = '/app/voice_models'
 
     # CORS SETTINGS
     CORS_ORIGINS: list[str] = Field(default_factory=list)

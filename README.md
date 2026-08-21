@@ -1,11 +1,11 @@
-# MySlave – Advanced Local AI Assistant Platform
+# Slave – Advanced Local AI Assistant Platform
 
 **Your data. Your AI. Your rules.** A AI assistant platform engineered for privacy, reliability, and transparency. Built on Angular 21 + FastAPI + MongoDB with intelligent multi-source reasoning, real-time streaming, and zero-hallucination architecture.
 
 
-## Why MySlave?
+## Why Slave?
 
-MySlave implements a controlled, source-aware Retrieval-Augmented Generation (RAG) pipeline to ground AI responses in verifiable data and prevent hallucinations.
+Slave implements a controlled, source-aware Retrieval-Augmented Generation (RAG) pipeline to ground AI responses in verifiable data and prevent hallucinations.
 Instead of relying solely on the language model’s internal knowledge, the system retrieves relevant information from multiple sources and injects it into the prompt with explicit confidence weighting.
 
 **100% Transparent Decision-Making** — See exactly why the AI answered what it did  
@@ -61,7 +61,7 @@ The AI doesn't just answer—it **intelligently assembles context** from multipl
 
 #### **Source Layer Separation**
 
-MySlave separates **factual sources** and **contextual sources**:
+Slave separates **factual sources** and **contextual sources**:
 
 **Factual (High Confidence)**
 
@@ -197,7 +197,12 @@ Per-session:
 - Enable reasoning mode for complex problem-solving
 - Custom system instructions per session (personality, expertise)
 
-### **6. Modern UI/UX**
+### **6. Hugging Face Model Integration**
+
+- Search the Hugging Face hub for GGUF models and list per-repo quant files (`GET /models/search`, `GET /models/search/{repo}/files`)
+- Pull models into Ollama with SSE progress streaming via `hf.co/{repo}:{quant}` names (`POST /models/pull`), plus list/delete installed models
+
+### **7. Modern UI/UX**
 
 - Clean, responsive design with CSS design system
 - Skeleton loaders and smooth animations
@@ -274,7 +279,7 @@ Open a terminal in the project root directory and run:
 
 ```bash
 # find where the project is located
-cd ~/MySlave
+cd ~/Slave
 ```
 
 ```bash
@@ -337,7 +342,7 @@ The Ollama container is running but **has no models yet**. Pull one:
 
 ```bash
 # Enter the Ollama container
-docker exec -it myslave-ollama-1 bash
+docker exec -it slave-ollama-1 bash
 
 # Inside container: Pull a model (choose one)
 ollama pull qwen2.5:3b
@@ -355,10 +360,25 @@ exit
 docker ps | grep ollama
 
 #Pull a model
-docker exec -it myslave-ollama-1 ollama pull qwen2.5:3b
-docker exec -it myslave-ollama-1 ollama pull gemma3:1b
-docker exec -it myslave-ollama-1 ollama pull <model>
+docker exec -it slave-ollama-1 ollama pull qwen2.5:3b
+docker exec -it slave-ollama-1 ollama pull gemma3:1b
+docker exec -it slave-ollama-1 ollama pull <model>
 
+```
+
+**Alternative: Pull via the API (Hugging Face GGUF or Ollama names)**
+
+No `docker exec` needed — `POST /models/pull` streams progress via SSE and accepts either a plain Ollama name or a Hugging Face GGUF reference:
+
+```bash
+curl -N -X POST http://localhost:8000/models/pull \
+  -H "Content-Type: application/json" \
+  -d '{"name": "qwen2.5:3b"}'
+
+# Or a Hugging Face GGUF model (discover via GET /models/search)
+curl -N -X POST http://localhost:8000/models/pull \
+  -H "Content-Type: application/json" \
+  -d '{"name": "hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"}'
 ```
 
 **Step 5: Access the Application**
@@ -437,11 +457,13 @@ All data persists in Docker named volumes:
 
 - `mongo_data`: MongoDB database (conversations, memories, rules)
 - `ollama_data`: Ollama models (multi-GB, survives restarts)
+- `qdrant_data`: Qdrant vector store (memory embeddings when `VECTOR_STORE=qdrant`)
+- `voice_models`: Whisper STT + Piper TTS model files
 
 Even after `docker compose down`, your data remains. To delete:
 
 ```bash
-docker volume rm myslave_mongo_data myslave_ollama_data
+docker volume rm slave_mongo_data slave_ollama_data slave_qdrant_data slave_voice_models
 ```
 
 #### **Troubleshooting**
@@ -671,6 +693,24 @@ npm test
 npm run test:coverage
 ```
 
+## Desktop (Tauri)
+
+The Angular frontend can also run as a native desktop app via [Tauri v2](https://v2.tauri.app/).
+
+**Prerequisites:** [Rust](https://rustup.rs/) (stable) and Node 20+.
+
+```bash
+cd frontend
+
+# Dev: opens a desktop window loading the ng serve dev server (localhost:4200)
+npm run tauri:dev
+
+# Build: bundles the static SPA build into a native app (frontend/src-tauri/target/release/bundle/)
+npm run tauri:build
+```
+
+The desktop app talks to the backend at `http://127.0.0.1:8000`, so the backend must be running via Docker Compose (e.g. `docker compose --profile dev up`).
+
 ## Troubleshooting
 
 ### **MongoDB Connection Failed**
@@ -690,7 +730,7 @@ sudo systemctl start mongod  # Linux
 docker start mongo
 
 # Create database (auto-created on first run)
-mongosh myslave
+mongosh slave
 ```
 
 ### **Ollama Not Responding**
@@ -728,7 +768,8 @@ python -m spacy download en_core_web_sm
 **100% Local Processing**: All AI inference runs on your machine  
 **No Telemetry**: Zero tracking, analytics, or data collection  
 **Local Data Storage**: All conversations stay in your MongoDB  
-**No Cloud Dependencies**: Works completely offline (except optional web search)  
+**Local-First**: After the first-run downloads below, inference runs fully offline. Web search (including DuckDuckGo and SearXNG queries) still goes out to the internet when triggered  
+**First run downloads**: embedding model (~90MB), Whisper `base` STT model (~150MB, on first voice use), Piper TTS voice (~60MB), and Ollama models (GB-scale)  
 **Optional Web** — Serper/Tavily only when you enable/trigger search  
 **Open Source**: Full code transparency, audit at any time
 **No Third-Party CDNs** — All assets bundled
@@ -788,7 +829,7 @@ CORS_ORIGINS=["http://localhost:4200"]  # Whitelist only
 
 - 8GB RAM
 - 4-core CPU
-- 20GB disk space
+- ~40GB disk space (Docker images + one 7B model + databases)
 - MongoDB 4.6+
 
 **Recommended**:
@@ -866,12 +907,12 @@ A: Recommended. System falls back to pattern-based extraction.
 ## Roadmap
 
 ### **Planned Features**
-1. Plugin system for custom model providers. (Unified Interface for e.g. openAi, anthropic, Hugging Face)
-2. Local Model Runtime Layer (ollama => lama.cpp or vLLM)
+1. ~~Plugin system for custom model providers~~ ✅ Implemented — LLM provider abstraction (`LLM_PROVIDER=ollama` or `LLM_PROVIDER=openai_compat` for vLLM / llama.cpp server / LM Studio / OpenAI)
+2. ~~Local Model Runtime Layer (ollama => lama.cpp or vLLM)~~ ✅ Supported via `LLM_PROVIDER=openai_compat`
 3. Hugging Face integration - AI model repository
-4. Vector database abstraction layer (Qdrant)
+4. ~~Vector database abstraction layer (Qdrant)~~ ✅ Implemented — `VECTOR_STORE=mongo` (default) or `VECTOR_STORE=qdrant`
 5. Tauri Desktop (UI)
-6. Voice input & output (speech → text → AI → speech)
+6. ~~Voice input & output (speech → text → AI → speech)~~ ✅ Implemented — local STT (faster-whisper) + TTS (Piper) via `/voice` endpoints
 7. Advanced GraphRAG + Tree-sitter AST + Tooling (Graph-enhanced retrieval / GraphRAG - experimental)
 8. Image & Video Generation - Stable Diffusion integration (From: Civitai, Run: ComfyUI)
 

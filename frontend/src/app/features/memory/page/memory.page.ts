@@ -2,13 +2,15 @@ import { Component, Input, effect, signal, Output, EventEmitter } from '@angular
 import { FormsModule } from '@angular/forms';
 import { CommonModule } from '@angular/common';
 import { MemoryStore } from '../store/memory.store';
+import { Memory } from '../service/memory.model';
 import { ChatStore } from '../../chat/store/chat.store';
 import { AutoResizeTextareaDirective } from '../../../shared/directives/auto-resize-textarea.directive';
+import { ErrorBannerComponent } from '../../../shared/ui/banner/error-banner.component';
 
 @Component({
   selector: 'app-memory-panel',
   standalone: true,
-  imports: [FormsModule, CommonModule, AutoResizeTextareaDirective],
+  imports: [FormsModule, CommonModule, AutoResizeTextareaDirective, ErrorBannerComponent],
   templateUrl: './memory.page.html',
   styleUrls: ['./memory.page.css'],
 })
@@ -16,6 +18,23 @@ export class MemoryPage {
   private _sessionId = signal<string | null>(null);
   private searchTimer: any;
   isCategoryDropdownOpen = false;
+
+  /** Two-click delete confirmation: id of the memory pending confirmation */
+  confirmingDeleteId: string | null = null;
+  private confirmTimer: any;
+
+  requestDelete(m: Memory): void {
+    if (this.confirmingDeleteId === m.id) {
+      clearTimeout(this.confirmTimer);
+      this.confirmingDeleteId = null;
+      this.store.delete(m);
+      return;
+    }
+    this.confirmingDeleteId = m.id;
+    clearTimeout(this.confirmTimer);
+    // Auto-reset the confirmation after a few seconds
+    this.confirmTimer = setTimeout(() => (this.confirmingDeleteId = null), 3000);
+  }
 
   @Input({ required: true })
   set sessionId(value: string) {

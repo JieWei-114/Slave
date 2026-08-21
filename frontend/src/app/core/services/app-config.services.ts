@@ -20,11 +20,32 @@ export interface ClientConfig {
 @Injectable({ providedIn: 'root' })
 export class AppConfigService {
   // Application metadata
-  readonly appName = 'MySlave';
+  readonly appName = 'Slave';
 
-  // Backend API endpoints
-  readonly apiBaseUrl = 'http://127.0.0.1:8000';
-  readonly wsUrl = 'ws://127.0.0.1:8000';
+  /**
+   * True when running inside the Tauri desktop shell.
+   * SSR-safe: window is only touched when defined.
+   */
+  readonly isTauri =
+    typeof window !== 'undefined' &&
+    ('__TAURI_INTERNALS__' in window || '__TAURI__' in window);
+
+  // Backend API endpoints (relative — proxied by nginx in prod, proxy.conf.json in dev).
+  // In the Tauri desktop shell the app is served from the tauri:// protocol,
+  // so relative URLs cannot reach the backend — talk to it directly instead.
+  readonly apiBaseUrl = this.isTauri ? 'http://127.0.0.1:8000' : '/api';
+
+  /**
+   * WebSocket URL derived from the current origin (or the absolute
+   * backend URL when running in Tauri).
+   * Only valid in the browser; returns '' during SSR.
+   */
+  get wsUrl(): string {
+    if (typeof window === 'undefined') return '';
+    if (this.isTauri) return this.apiBaseUrl.replace(/^http/, 'ws');
+    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    return `${proto}://${window.location.host}${this.apiBaseUrl}`;
+  }
 
   // Dynamic configuration loaded from backend
   private clientConfig: ClientConfig = {

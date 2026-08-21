@@ -112,6 +112,7 @@ export interface ChatSession {
   title: string; // Session title (editable)
   messages: ChatMessage[]; // Array of messages in conversation
   rules?: RulesConfig; // Session-specific rules configuration
+  isTemp?: boolean; // True for local-only sessions not yet persisted to backend
   hasMore?: boolean; // Flag for pagination (more messages available)
   loadingMore?: boolean; // Loading state for pagination
 }

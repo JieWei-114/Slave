@@ -1,0 +1,106 @@
+<div class="models-container">
+  <div class="models-header">
+    <h2>Models</h2>
+    <span class="provider" *ngIf="store.provider()">Provider: {{ store.provider() }}</span>
+  </div>
+
+  <app-error-banner [message]="store.error()" [dismissible]="true" (dismiss)="store.clearError()" />
+
+  <!-- Active pull progress -->
+  <div class="pull-progress" *ngIf="store.isPulling()">
+    <div class="pull-info">
+      <span class="pull-name">Pulling {{ store.pullingName() }}</span>
+      <span class="pull-status">{{ store.pullStatus() }}</span>
+      <span class="pull-pct" *ngIf="store.pullTotal()">
+        {{ formatBytes(store.pullCompleted()) }} / {{ formatBytes(store.pullTotal()) }} ({{
+          store.pullPct()
+        }}%)
+      </span>
+    </div>
+    <div class="progress-bar">
+      <div class="progress-fill" [style.width.%]="store.pullPct()"></div>
+    </div>
+    <button class="btn-cancel-pull" (click)="store.stopPull()" title="Cancel download">
+      Cancel
+    </button>
+  </div>
+
+  <!-- Installed models -->
+  <section class="models-section">
+    <h3>Installed</h3>
+    <div class="loading" *ngIf="store.loading()">Loading models…</div>
+
+    <div class="model-list" *ngIf="!store.loading()">
+      <div class="model-item" *ngFor="let m of store.installed(); trackBy: trackByName">
+        <span class="model-name">{{ m.name }}</span>
+        <span class="model-size" *ngIf="m['size']">{{ formatBytes(+m['size']!) }}</span>
+        <button
+          class="btn-delete"
+          [class.confirming]="confirmingDeleteName === m.name"
+          (click)="requestDelete(m.name)"
+          [title]="
+            confirmingDeleteName === m.name ? 'Click again to confirm delete' : 'Delete model'
+          "
+        >
+          {{ confirmingDeleteName === m.name ? 'Delete? ✓' : '🗑' }}
+        </button>
+      </div>
+
+      <div class="empty-state" *ngIf="!store.installed().length">
+        <h3>No models installed</h3>
+        <p>Search below to find and install a model</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Search -->
+  <section class="models-section">
+    <h3>Find a model</h3>
+    <input
+      class="search-input"
+      type="text"
+      [(ngModel)]="query"
+      (ngModelChange)="onSearchInput()"
+      placeholder="Search models (e.g. llama, qwen)..."
+    />
+    <div class="loading" *ngIf="store.searching()">Searching…</div>
+
+    <div class="result-list" *ngIf="store.searchResults().length">
+      <button
+        class="result-item"
+        *ngFor="let r of store.searchResults()"
+        [class.selected]="repoId(r) === store.selectedRepo()"
+        (click)="selectResult(r)"
+      >
+        {{ repoId(r) }}
+      </button>
+    </div>
+  </section>
+
+  <!-- Quant files for selected repo -->
+  <section class="models-section" *ngIf="store.selectedRepo()">
+    <h3>Files for {{ store.selectedRepo() }}</h3>
+    <div class="loading" *ngIf="store.loadingFiles()">Loading files…</div>
+
+    <div class="file-list" *ngIf="!store.loadingFiles()">
+      <div class="file-item" *ngFor="let f of store.files(); trackBy: trackByFilename">
+        <div class="file-info">
+          <span class="file-name">{{ f.filename }}</span>
+          <span class="file-meta">{{ f.quant }} · {{ formatBytes(f.size_bytes) }}</span>
+        </div>
+        <button
+          class="btn-pull"
+          (click)="pullFile(f)"
+          [disabled]="store.isPulling()"
+          [title]="store.isPulling() ? 'Another download is in progress' : 'Download this model'"
+        >
+          Pull
+        </button>
+      </div>
+
+      <div class="empty-state" *ngIf="!store.files().length">
+        <p>No downloadable files found for this repository</p>
+      </div>
+    </div>
+  </section>
+</div>

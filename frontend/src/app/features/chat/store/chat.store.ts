@@ -50,8 +50,11 @@ export class ChatStore {
   // Loading state for async operations
   readonly loading = signal(false);
 
-  // Error messages to display to the user
+  // Error messages to display to the user (inline banner)
   readonly error = signal('');
+
+  // Fatal session-load failure — the only case that shows the full-screen boundary
+  readonly sessionLoadError = signal('');
 
   // Currently selected AI model for chat
   readonly currentModel = signal<AIModel>(DEFAULT_MODEL);
@@ -115,13 +118,13 @@ export class ChatStore {
    * Sidebar Helper
    */
 
-  // Only show sessions that are active, have messages, or have custom titles
-  // Hides empty "New chat" sessions from sidebar
+  // Only show sessions that are active, have messages, or are persisted
+  // Hides empty temp sessions from sidebar
   readonly visibleSessions = computed(() => {
     const active = this.currentSessionId();
 
     return (Object.values(this.sessions()) as ChatSession[]).filter(
-      (s: ChatSession) => s.id === active || s.messages.length > 0 || s.title !== 'New chat',
+      (s: ChatSession) => s.id === active || s.messages.length > 0 || !s.isTemp,
     );
   });
 
@@ -210,61 +213,7 @@ export class ChatStore {
    * Updates session-specific rules in backend
    */
   toggleFollowUp(): void {
-    const session = this.currentSession();
-    if (!session) return;
-
-    const currentValue = session.rules?.followUpEnabled ?? false;
-    const newValue = !currentValue;
-
-    // Optimistically update local state
-    this.sessions.update((sessions: Record<string, ChatSession>) => ({
-      ...sessions,
-      [session.id]: {
-        ...session,
-        rules: {
-          ...DEFAULT_RULES,
-          ...session.rules,
-          followUpEnabled: newValue,
-        },
-      },
-    }));
-
-    // Persist to backend
-    const updatedRules: RulesConfig = {
-      ...DEFAULT_RULES,
-      ...session.rules,
-      followUpEnabled: newValue,
-    };
-
-    this.rulesApi.updateSessionRules(session.id, updatedRules).subscribe({
-      next: (rules: RulesConfig) => {
-        this.log(`Follow-up toggled to ${newValue} for session ${session.id}`);
-        // Update with response from server to ensure consistency
-        this.sessions.update((sessions: Record<string, ChatSession>) => ({
-          ...sessions,
-          [session.id]: {
-            ...session,
-            rules: rules,
-          },
-        }));
-      },
-      error: (err: any) => {
-        this.logError(`Failed to update follow-up setting: ${err}`);
-        // Revert optimistic update on error
-        this.sessions.update((sessions: Record<string, ChatSession>) => ({
-          ...sessions,
-          [session.id]: {
-            ...session,
-            rules: {
-              ...DEFAULT_RULES,
-              ...session.rules,
-              followUpEnabled: currentValue,
-            },
-          },
-        }));
-        this.error.set('Failed to update follow-up setting');
-      },
-    });
+    this.toggleRule('followUpEnabled', 'follow-up');
   }
 
   /**
@@ -272,59 +221,51 @@ export class ChatStore {
    * Updates session-specific rules in backend
    */
   toggleReasoning(): void {
+    this.toggleRule('reasoningEnabled', 'reasoning');
+  }
+
+  /**
+   * Toggle a boolean rule on the current session with optimistic update,
+   * backend persistence, and revert on failure.
+   */
+  private toggleRule(key: 'followUpEnabled' | 'reasoningEnabled', label: string): void {
     const session = this.currentSession();
     if (!session) return;
 
-    const currentValue = session.rules?.reasoningEnabled ?? false;
+    const currentValue = session.rules?.[key] ?? false;
     const newValue = !currentValue;
 
-    // Optimistically update local state
-    this.sessions.update((sessions: Record<string, ChatSession>) => ({
-      ...sessions,
-      [session.id]: {
-        ...session,
-        rules: {
-          ...DEFAULT_RULES,
-          ...session.rules,
-          reasoningEnabled: newValue,
-        },
-      },
-    }));
-
-    // Persist to backend
-    const updatedRules: RulesConfig = {
+    const withRules = (value: boolean): RulesConfig => ({
       ...DEFAULT_RULES,
       ...session.rules,
-      reasoningEnabled: newValue,
+      [key]: value,
+    });
+
+    const applyRules = (rules: RulesConfig) => {
+      this.sessions.update((sessions: Record<string, ChatSession>) => ({
+        ...sessions,
+        [session.id]: {
+          ...session,
+          rules,
+        },
+      }));
     };
 
-    this.rulesApi.updateSessionRules(session.id, updatedRules).subscribe({
+    // Optimistically update local state
+    applyRules(withRules(newValue));
+
+    // Persist to backend
+    this.rulesApi.updateSessionRules(session.id, withRules(newValue)).subscribe({
       next: (rules: RulesConfig) => {
-        this.log(`Reasoning toggled to ${newValue} for session ${session.id}`);
+        this.log(`${label} toggled to ${newValue} for session ${session.id}`);
         // Update with response from server to ensure consistency
-        this.sessions.update((sessions: Record<string, ChatSession>) => ({
-          ...sessions,
-          [session.id]: {
-            ...session,
-            rules: rules,
-          },
-        }));
+        applyRules(rules);
       },
       error: (err: any) => {
-        this.logError(`Failed to update reasoning setting: ${err}`);
+        this.logError(`Failed to update ${label} setting: ${err}`);
         // Revert optimistic update on error
-        this.sessions.update((sessions: Record<string, ChatSession>) => ({
-          ...sessions,
-          [session.id]: {
-            ...session,
-            rules: {
-              ...DEFAULT_RULES,
-              ...session.rules,
-              reasoningEnabled: currentValue,
-            },
-          },
-        }));
-        this.error.set('Failed to update reasoning setting');
+        applyRules(withRules(currentValue));
+        this.error.set(`Failed to update ${label} setting`);
       },
     });
   }
@@ -356,6 +297,7 @@ export class ChatStore {
     this.log('Loading chat sessions');
     this.loading.set(true);
     this.error.set('');
+    this.sessionLoadError.set('');
 
     this.chatApi.getSessions().subscribe({
       next: (sessions: any[]) => {
@@ -368,26 +310,34 @@ export class ChatStore {
           return;
         }
 
-        // Convert array to dictionary for efficient lookups
-        const map: Record<string, ChatSession> = {};
+        // Merge fetched sessions into the existing map (preserve temp sessions
+        // and any already-loaded messages)
+        this.sessions.update((existing: Record<string, ChatSession>) => {
+          const map: Record<string, ChatSession> = { ...existing };
+          for (const s of sessions) {
+            const prev = map[s.id];
+            map[s.id] = {
+              ...prev,
+              id: s.id,
+              title: s.title,
+              messages: prev?.messages ?? [], // Messages loaded lazily when session is selected
+              isTemp: false,
+            };
+          }
+          return map;
+        });
 
-        for (const s of sessions) {
-          map[s.id] = {
-            id: s.id,
-            title: s.title,
-            messages: [], // Messages loaded lazily when session is selected
-          };
+        // Only auto-select the first session if nothing is selected yet
+        if (this.currentSessionId() === null) {
+          this.currentSessionId.set(sessions[0].id);
         }
-
-        this.sessions.set(map);
-        this.currentSessionId.set(sessions[0].id);
         this.log(`Sessions loaded: ${sessions.length}`);
 
         this.loading.set(false);
       },
       error: (err: unknown) => {
         this.logError(`Failed to load sessions: ${err}`);
-        this.error.set('Failed to load sessions');
+        this.sessionLoadError.set('Failed to load sessions');
         this.loading.set(false);
       },
     });
@@ -429,16 +379,34 @@ export class ChatStore {
 
     const session = this.sessions()[id];
 
-    // Create session if it doesn't exist (happens with URL navigation)
+    // Unknown id (happens with URL navigation): try to fetch it from the
+    // backend first; only fall back to a temp stub if it doesn't exist there.
     if (!session) {
-      this.sessions.update((s: Record<string, ChatSession>) => ({
-        ...s,
-        [id]: {
-          id,
-          title: 'New chat',
-          messages: [],
+      this.chatApi.getSessionbyId(id).subscribe({
+        next: (fullSession: ChatSession) => {
+          this.log(`Session loaded from server: ${id}`);
+          this.sessions.update((s: Record<string, ChatSession>) => ({
+            ...s,
+            [id]: { ...fullSession, messages: fullSession.messages ?? [] },
+          }));
+          // Ensure messages are loaded for the found session
+          if (!fullSession.messages?.length) {
+            this.loadLatestMessages(id);
+          }
         },
-      }));
+        error: () => {
+          this.log(`Session ${id} not found on server, creating temp stub`);
+          this.sessions.update((s: Record<string, ChatSession>) => ({
+            ...s,
+            [id]: {
+              id,
+              title: 'New chat',
+              messages: [],
+              isTemp: true,
+            },
+          }));
+        },
+      });
       return;
     }
 
@@ -446,7 +414,7 @@ export class ChatStore {
     if (session.messages.length > 0) return;
 
     // Don't load messages for unsaved temp sessions
-    if (session.title === 'New chat') return;
+    if (session.isTemp) return;
 
     // Load full session data from backend
     this.chatApi.getSessionbyId(id).subscribe({
@@ -476,6 +444,7 @@ export class ChatStore {
         id,
         title: 'New chat',
         messages: [],
+        isTemp: true,
       },
     }));
 
@@ -583,7 +552,6 @@ export class ChatStore {
 
   // SSE streaming control and retry logic
   stopStreaming: (() => void) | null = null;
-  private messageRetryCount = 0;
   private maxRetries = 3;
 
   sendMessage(content: string, attachment?: { filename: string; content: string }): void {
@@ -594,8 +562,7 @@ export class ChatStore {
 
     const tempSession = this.sessions()[tempId];
 
-    const isTempSession =
-      !tempSession || (tempSession.title === 'New chat' && tempSession.messages.length === 0);
+    const isTempSession = !tempSession || (tempSession.isTemp && tempSession.messages.length === 0);
 
     const generatedTitle = content.split('\n')[0].slice(0, 40);
 
@@ -603,7 +570,9 @@ export class ChatStore {
 
     this.loading.set(true);
     this.error.set('');
-    this.messageRetryCount = 0;
+    // Reset verification status for the new exchange (otherwise it stays
+    // 'verified' from the previous message)
+    this.verificationStatus.set({ type: 'idle' });
 
     const startStreaming = (sessionId: string) => {
       const startSse = () => {
@@ -677,7 +646,6 @@ export class ChatStore {
             this.log(`Message streaming completed for session ${sessionId}`);
             this.loading.set(false);
             this.stopStreaming = null;
-            this.messageRetryCount = 0;
 
             this.sessions.update((s: Record<string, ChatSession>) => {
               const msgs = [...s[sessionId].messages];
@@ -732,6 +700,23 @@ export class ChatStore {
             }
           },
           this.reasoningEnabled(),
+          (err: unknown) => {
+            // Stream failed: surface the error instead of pretending success
+            this.logError(`Message streaming failed for session ${sessionId}: ${err}`);
+            this.error.set('Failed to stream response');
+            this.loading.set(false);
+            this.stopStreaming = null;
+            this.verificationStatus.set({ type: 'idle' });
+
+            // Remove the partial/empty assistant message
+            this.sessions.update((s: Record<string, ChatSession>) => {
+              const msgs = [...s[sessionId].messages];
+              if (assistantIndex >= 0 && assistantIndex < msgs.length) {
+                msgs.splice(assistantIndex, 1);
+              }
+              return { ...s, [sessionId]: { ...s[sessionId], messages: msgs } };
+            });
+          },
         );
       };
 
@@ -751,40 +736,41 @@ export class ChatStore {
     };
 
     if (isTempSession) {
-      this.chatApi.createSession(generatedTitle).subscribe({
-        next: (session: ChatSession) => {
-          this.log(`New session created: ${session.id}`);
-          this.sessions.update((s: Record<string, ChatSession>) => {
-            const copy = { ...s };
-            delete copy[tempId];
-            return {
-              ...copy,
-              [session.id]: {
-                id: session.id,
-                title: session.title,
-                messages: [],
-              },
-            };
-          });
+      // Retry only the createSession step, with a bounded attempt counter
+      const attemptCreateSession = (attempt: number): void => {
+        this.chatApi.createSession(generatedTitle).subscribe({
+          next: (session: ChatSession) => {
+            this.log(`New session created: ${session.id}`);
+            this.sessions.update((s: Record<string, ChatSession>) => {
+              const copy = { ...s };
+              delete copy[tempId];
+              return {
+                ...copy,
+                [session.id]: {
+                  id: session.id,
+                  title: session.title,
+                  messages: [],
+                },
+              };
+            });
 
-          this.currentSessionId.set(session.id);
-          startStreaming(session.id);
-        },
-        error: (err: unknown) => {
-          this.logError(`Failed to create session: ${err}`);
-          // Retry logic
-          if (this.messageRetryCount < this.maxRetries) {
-            this.messageRetryCount++;
-            this.log(
-              `Retrying session creation: attempt ${this.messageRetryCount} of ${this.maxRetries}`,
-            );
-            setTimeout(() => this.sendMessage(content, attachment), 1000);
-          } else {
-            this.error.set('Failed to create session');
-            this.loading.set(false);
-          }
-        },
-      });
+            this.currentSessionId.set(session.id);
+            startStreaming(session.id);
+          },
+          error: (err: unknown) => {
+            this.logError(`Failed to create session: ${err}`);
+            if (attempt < this.maxRetries) {
+              this.log(`Retrying session creation: attempt ${attempt + 1} of ${this.maxRetries}`);
+              setTimeout(() => attemptCreateSession(attempt + 1), 1000);
+            } else {
+              this.error.set('Failed to create session');
+              this.loading.set(false);
+            }
+          },
+        });
+      };
+
+      attemptCreateSession(0);
     } else {
       startStreaming(tempId);
     }
@@ -794,6 +780,29 @@ export class ChatStore {
     this.stopStreaming?.();
     this.stopStreaming = null;
     this.loading.set(false);
+    this.verificationStatus.set({ type: 'idle' });
+
+    // Clear the streaming flag on the last assistant message so the UI
+    // doesn't stay stuck in "reasoning" state
+    const sessionId = this.currentSessionId();
+    if (!sessionId) return;
+    this.sessions.update((s: Record<string, ChatSession>) => {
+      const session = s[sessionId];
+      if (!session) return s;
+      const msgs = [...session.messages];
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].role === 'assistant') {
+          if (msgs[i].meta?.reasoning_streaming) {
+            msgs[i] = {
+              ...msgs[i],
+              meta: { ...(msgs[i].meta ?? {}), reasoning_streaming: false },
+            };
+          }
+          break;
+        }
+      }
+      return { ...s, [sessionId]: { ...session, messages: msgs } };
+    });
   }
 
   removeMessagesFrom(startIndex: number): void {

@@ -5,6 +5,7 @@
 import {
   Component,
   OnInit,
+  OnDestroy,
   inject,
   signal,
   HostListener,
@@ -16,7 +17,7 @@ import {
 } from '@angular/core';
 import { isPlatformBrowser, CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { ActivatedRoute } from '@angular/router';
+import { ActivatedRoute, RouterLink } from '@angular/router';
 import { HttpClient } from '@angular/common/http';
 
 import { ChatStore } from '../store/chat.store';
@@ -30,6 +31,7 @@ import { SkeletonComponent } from '../../../shared/ui/skeleton/skeleton.componen
 import { ErrorBoundaryComponent } from '../../../shared/ui/error-boundary/error-boundary.component';
 import { AppConfigService } from '../../../core/services/app-config.services';
 import { AutoResizeTextareaDirective } from '../../../shared/directives/auto-resize-textarea.directive';
+import { VoiceApi } from '../services/voice.api';
 
 @Component({
   selector: 'app-chat-page',
@@ -45,19 +47,22 @@ import { AutoResizeTextareaDirective } from '../../../shared/directives/auto-res
     SkeletonComponent,
     ErrorBoundaryComponent,
     AutoResizeTextareaDirective,
+    RouterLink,
     // PrefixPipe
   ],
   templateUrl: './chat.page.html',
   styleUrls: ['./chat.page.css'],
 })
-export class ChatPage implements OnInit, AfterViewInit {
+export class ChatPage implements OnInit, AfterViewInit, OnDestroy {
   private http = inject(HttpClient);
   private config = inject(AppConfigService);
   private platformId = inject(PLATFORM_ID);
+  voiceApi = inject(VoiceApi);
 
   @ViewChild('chatTextarea', { read: ElementRef }) textareaRef?: ElementRef<HTMLTextAreaElement>;
 
   models = signal<AIModel[]>(AVAILABLE_MODELS);
+  noModelsInstalled = signal(false);
   isDropdownOpen = false;
   isErrorDismissed = signal(false);
   selectedFileName = signal('');
@@ -65,6 +70,23 @@ export class ChatPage implements OnInit, AfterViewInit {
   isFileUploading = signal(false);
   private fileContent = signal('');
   private pendingFile: File | null = null;
+
+  // Voice input (speech-to-text) state
+  isRecording = signal(false);
+  isTranscribing = signal(false);
+  /** True while a slow first transcription is likely downloading the voice model */
+  voiceDownloadHint = signal(false);
+  private voiceHintTimer: ReturnType<typeof setTimeout> | null = null;
+  voiceError = signal('');
+  micSupported = signal(false);
+  private mediaRecorder: MediaRecorder | null = null;
+  private mediaStream: MediaStream | null = null;
+  private audioChunks: Blob[] = [];
+  private recordingTimeout: ReturnType<typeof setTimeout> | null = null;
+  private micStarting = false;
+
+  /** Max recording length before auto-stop (ms) */
+  private static readonly MAX_RECORDING_MS = 60_000;
 
   get message(): string {
     return this.store.draftMessage();
@@ -95,10 +117,179 @@ export class ChatPage implements OnInit, AfterViewInit {
   ngOnInit(): void {
     // Load available AI models from backend
     this.loadModels();
+
+    // Voice capabilities — browser only, never blocks page load
+    if (isPlatformBrowser(this.platformId)) {
+      this.micSupported.set(
+        typeof navigator !== 'undefined' &&
+          !!navigator.mediaDevices?.getUserMedia &&
+          typeof MediaRecorder !== 'undefined',
+      );
+      this.voiceApi.loadConfig();
+    }
+  }
+
+  /**
+   * Toggle microphone recording: start on first click, stop + transcribe on second
+   */
+  async toggleRecording(): Promise<void> {
+    if (this.isRecording()) {
+      this.stopRecording();
+      return;
+    }
+
+    if (!this.micSupported() || this.isTranscribing()) return;
+
+    // Guard against double-click: bail if a start is already in flight
+    if (this.micStarting) return;
+    this.micStarting = true;
+
+    this.voiceError.set('');
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      this.micStarting = false;
+      this.voiceError.set('Microphone access denied. Check browser permissions.');
+      return;
+    }
+
+    // If recording started elsewhere while we awaited, release this stream
+    if (this.isRecording()) {
+      stream.getTracks().forEach((track) => track.stop());
+      this.micStarting = false;
+      return;
+    }
+
+    const preferredType = 'audio/webm;codecs=opus';
+    const options =
+      typeof MediaRecorder.isTypeSupported === 'function' &&
+      MediaRecorder.isTypeSupported(preferredType)
+        ? { mimeType: preferredType }
+        : undefined;
+
+    this.mediaStream = stream;
+    this.audioChunks = [];
+    try {
+      this.mediaRecorder = new MediaRecorder(stream, options);
+    } catch {
+      stream.getTracks().forEach((track) => track.stop());
+      this.mediaStream = null;
+      this.micStarting = false;
+      this.voiceError.set('Recording is not supported in this browser.');
+      return;
+    }
+
+    this.mediaRecorder.ondataavailable = (e: BlobEvent) => {
+      if (e.data.size > 0) this.audioChunks.push(e.data);
+    };
+    this.mediaRecorder.onstop = () => this.handleRecordingStopped();
+
+    this.mediaRecorder.start();
+    this.isRecording.set(true);
+    this.micStarting = false;
+
+    // Auto-stop after 60 seconds
+    this.recordingTimeout = setTimeout(() => this.stopRecording(), ChatPage.MAX_RECORDING_MS);
+  }
+
+  /**
+   * Stop the active recording (triggers transcription via onstop)
+   */
+  private stopRecording(): void {
+    if (this.recordingTimeout) {
+      clearTimeout(this.recordingTimeout);
+      this.recordingTimeout = null;
+    }
+    if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+      this.mediaRecorder.stop();
+    }
+    this.isRecording.set(false);
+  }
+
+  /**
+   * Assemble recorded audio and transcribe it; append text to the draft
+   */
+  private async handleRecordingStopped(): Promise<void> {
+    const mimeType = this.mediaRecorder?.mimeType || 'audio/webm';
+    const blob = new Blob(this.audioChunks, { type: mimeType });
+    this.releaseMicrophone();
+
+    if (blob.size === 0) return;
+
+    this.isTranscribing.set(true);
+    // Flip a hint after 3s: a long first transcription means the model is downloading
+    this.clearVoiceHintTimer();
+    this.voiceHintTimer = setTimeout(() => this.voiceDownloadHint.set(true), 3000);
+    try {
+      const { text } = await this.voiceApi.transcribe(blob);
+      this.voiceApi.sttReady.set(true);
+      const transcribed = (text ?? '').trim();
+      if (transcribed) {
+        const draft = this.store.draftMessage();
+        this.store.setDraftMessage(draft ? `${draft} ${transcribed}` : transcribed);
+        this.triggerResize();
+      }
+    } catch {
+      this.voiceError.set('Transcription failed. Please try again.');
+    } finally {
+      this.clearVoiceHintTimer();
+      this.voiceDownloadHint.set(false);
+      this.isTranscribing.set(false);
+    }
+  }
+
+  private clearVoiceHintTimer(): void {
+    if (this.voiceHintTimer) {
+      clearTimeout(this.voiceHintTimer);
+      this.voiceHintTimer = null;
+    }
+  }
+
+  /** Tooltip for the mic button, aware of model readiness and downloads */
+  get micTitle(): string {
+    if (this.isTranscribing() && this.voiceDownloadHint()) return 'Downloading voice model…';
+    if (this.isRecording()) return 'Stop recording';
+    if (!this.voiceApi.sttReady()) return 'First use will download the voice model (~30s)';
+    return 'Record voice message';
+  }
+
+  /**
+   * Release microphone tracks and recorder resources
+   */
+  private releaseMicrophone(): void {
+    this.mediaStream?.getTracks().forEach((track) => track.stop());
+    this.mediaStream = null;
+    this.mediaRecorder = null;
+    this.audioChunks = [];
   }
 
   ngAfterViewInit(): void {
     // Lifecycle hook - resize effect is in constructor
+  }
+
+  ngOnDestroy(): void {
+    this.clearVoiceHintTimer();
+    // Clean up mic resources: no transcription should fire after destroy
+    if (this.recordingTimeout) {
+      clearTimeout(this.recordingTimeout);
+      this.recordingTimeout = null;
+    }
+    if (this.mediaRecorder) {
+      this.mediaRecorder.onstop = null;
+      if (this.mediaRecorder.state !== 'inactive') {
+        this.mediaRecorder.stop();
+      }
+    }
+    this.releaseMicrophone();
+    this.isRecording.set(false);
+  }
+
+  /**
+   * TrackBy for the messages *ngFor
+   */
+  trackByMessage(index: number, msg: { role: string; created_at: string }): string {
+    return `${msg.role}:${msg.created_at}`;
   }
 
   /**
@@ -125,15 +316,21 @@ export class ChatPage implements OnInit, AfterViewInit {
   }
 
   /**
-   * Load available AI models from backend API
-   * Falls back to default models if API fails
+   * Load available AI models from backend API.
+   * An empty list is respected (no silent fallback) and flips the
+   * first-run guidance flag; only a failed fetch falls back to defaults.
    */
   private loadModels(): void {
     this.http.get<AIModel[]>(`${this.config.apiBaseUrl}/chat/models`).subscribe({
-      next: (data: any) => this.models.set(data),
+      next: (data: AIModel[]) => {
+        const list = data ?? [];
+        this.models.set(list);
+        this.noModelsInstalled.set(list.length === 0);
+      },
       error: () => {
         console.warn('Failed to load models from API, using defaults');
         this.models.set(AVAILABLE_MODELS);
+        this.noModelsInstalled.set(true);
       },
     });
   }
@@ -218,10 +415,15 @@ export class ChatPage implements OnInit, AfterViewInit {
   }
 
   /**
-   * Check if user is currently typing (for UI feedback)
+   * Show the typing indicator while the AI is working and no
+   * assistant tokens have arrived yet.
    */
   get isTyping(): boolean {
-    return !!this.store.draftMessage().trim() && !this.store.loading();
+    if (!this.store.loading()) return false;
+    const messages = this.store.messageList();
+    if (!messages.length) return false;
+    const last = messages[messages.length - 1];
+    return last.role === 'user' || (last.role === 'assistant' && !last.content);
   }
 
   /**
@@ -316,6 +518,10 @@ export class ChatPage implements OnInit, AfterViewInit {
     this.store.loadSessions();
   }
 
+  dismissSessionError(): void {
+    this.store.sessionLoadError.set('');
+  }
+
   toggleDropdown(event: MouseEvent) {
     event.stopPropagation();
     this.isDropdownOpen = !this.isDropdownOpen;
@@ -333,6 +539,7 @@ export class ChatPage implements OnInit, AfterViewInit {
 
   dismissError() {
     this.isErrorDismissed.set(true);
+    this.store.error.set('');
   }
 
   clearFile(): void {

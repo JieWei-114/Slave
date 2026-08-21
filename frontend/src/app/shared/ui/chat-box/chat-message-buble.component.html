@@ -32,7 +32,12 @@
     </div>
 
     <!-- Main Content -->
-    <div class="main-content">
+    <div
+      class="main-content markdown-body"
+      *ngIf="isAssistant"
+      [innerHTML]="message.content | markdown"
+    ></div>
+    <div class="main-content" *ngIf="!isAssistant">
       {{ message.content }}
     </div>
   </div>
@@ -73,6 +78,18 @@
       title="Toggle response metadata"
     >
       Context
+    </button>
+
+    <button
+      class="speak"
+      [class.speaking]="isSpeaking"
+      *ngIf="canSpeak"
+      (click)="toggleSpeak()"
+      [disabled]="isSpeakLoading"
+      [title]="speakTitle"
+      [attr.aria-label]="isSpeaking ? 'Stop playback' : 'Read message aloud'"
+    >
+      {{ isSpeakLoading ? '…' : isSpeaking ? 'Stop' : 'Speak' }}
     </button>
 
     <button class="edit" *ngIf="isUser && isLastUserMessage" (click)="startEdit()">Edit</button>

@@ -404,3 +404,16 @@
 .arrow.open {
   transform: rotate(180deg);
 }
+
+.memory-loading {
+  padding: var(--spacing-sm) var(--spacing-md);
+  color: var(--gray-400);
+  font-size: 12px;
+}
+
+.btn-delete.confirming {
+  background: var(--error-color);
+  color: white;
+  font-size: 11px;
+  white-space: nowrap;
+}

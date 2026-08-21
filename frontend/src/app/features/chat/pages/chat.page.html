@@ -33,12 +33,17 @@
     <div *ngIf="store.isEmpty()" class="empty-state">
       <h3>Start a conversation</h3>
       <p>Select a model and send your first message</p>
+
+      <div class="no-models-callout" *ngIf="noModelsInstalled()">
+        <p>No AI models installed yet — open Models to install one</p>
+        <button class="btn-open-models" routerLink="/models">Open Models</button>
+      </div>
     </div>
 
     <!-- Messages -->
     <div class="messages-container" *ngIf="store.hasMessages()">
       <app-chat-message-bubble
-        *ngFor="let msg of store.messageList(); let i = index"
+        *ngFor="let msg of store.messageList(); let i = index; trackBy: trackByMessage"
         [message]="msg"
         [isLastUserMessage]="isLastUserMessage(msg, i)"
         (editAndResend)="onEditAndResend($event.content, $event.attachment)"
@@ -53,7 +58,7 @@
     </div>
   </div>
 
-  <app-error-banner [message]="store.error()" />
+  <app-error-banner [message]="store.error()" [dismissible]="true" (dismiss)="dismissError()" />
 
   <div class="chat-input-wrapper">
     <div class="chat-button-wrapper">
@@ -124,6 +129,19 @@
       ></textarea>
 
       <div class="input-actions">
+        <button
+          *ngIf="micSupported() && voiceApi.sttEnabled()"
+          class="btn-mic"
+          [class.recording]="isRecording()"
+          (click)="toggleRecording()"
+          [disabled]="store.loading() || isTranscribing()"
+          [title]="micTitle"
+          [attr.aria-label]="micTitle"
+          [attr.aria-pressed]="isRecording()"
+        >
+          {{ isTranscribing() ? '…' : isRecording() ? '■' : '🎤' }}
+        </button>
+
         <app-button *ngIf="store.loading()" (click)="store.stop()" title="Stop generation">
           Stop
         </app-button>
@@ -139,18 +157,23 @@
       </div>
     </div>
 
-    <div class="file-meta" *ngIf="selectedFileName() || fileError()">
+    <div
+      class="file-meta"
+      *ngIf="selectedFileName() || fileError() || voiceError() || voiceDownloadHint()"
+    >
       <span *ngIf="selectedFileName()">Attached: {{ selectedFileName() }}</span>
       <span *ngIf="fileError()" class="file-error">{{ fileError() }}</span>
+      <span *ngIf="voiceError()" class="file-error">{{ voiceError() }}</span>
+      <span *ngIf="voiceDownloadHint() && isTranscribing()">Downloading voice model…</span>
     </div>
   </div>
 </div>
 
-<!-- Error boundary -->
+<!-- Full-screen boundary — reserved for fatal session-load failures -->
 <app-error-boundary
-  *ngIf="store.error() && !isErrorDismissed()"
-  [error]="store.error()"
+  *ngIf="store.sessionLoadError()"
+  [error]="store.sessionLoadError()"
   (retry)="retryLoadSessions()"
-  (close)="dismissError()"
+  (close)="dismissSessionError()"
 >
 </app-error-boundary>

@@ -55,6 +55,34 @@ async def update_rules(rules: RulesConfig):
         raise HTTPException(status_code=HTTP_INTERNAL_ERROR, detail='Failed to update rules')
 
 
+@router.get('/client-config')
+def get_client_config():
+    """
+    Get client-side configuration from backend.
+
+    Frontend calls this during app initialization to synchronize settings.
+    This ensures frontend file upload limits match backend validation rules.
+
+    NOTE: This static route MUST be declared before the parameterized
+    /{session_id} route, otherwise FastAPI would match 'client-config'
+    as a session_id and this endpoint would be unreachable.
+
+    """
+    try:
+        logger.info('Fetching client config')
+        # Sync frontend limits with backend settings
+        return {
+            'fileUpload': {
+                'maxSizeMB': settings.FILE_UPLOAD_MAX_SIZE_MB,
+                'allowedBinaryExtensions': settings.FILE_UPLOAD_ALLOWED_EXTENSIONS,
+                'maxExtractChars': settings.FILE_UPLOAD_MAX_CHARS,
+            }
+        }
+    except Exception as e:
+        logger.error(f'Error fetching client config: {e}', exc_info=True)
+        raise HTTPException(status_code=HTTP_INTERNAL_ERROR, detail='Failed to fetch client config')
+
+
 @router.get('/{session_id}', response_model=RulesConfig)
 async def get_session_rules(session_id: str):
     """
@@ -119,27 +147,3 @@ async def update_session_rules(session_id: str, rules: RulesConfig):
         raise HTTPException(
             status_code=HTTP_INTERNAL_ERROR, detail='Failed to update session rules'
         )
-
-
-@router.get('/client-config')
-def get_client_config():
-    """
-    Get client-side configuration from backend.
-
-    Frontend calls this during app initialization to synchronize settings.
-    This ensures frontend file upload limits match backend validation rules.
-
-    """
-    try:
-        logger.info('Fetching client config')
-        # Sync frontend limits with backend settings
-        return {
-            'fileUpload': {
-                'maxSizeMB': settings.FILE_UPLOAD_MAX_SIZE_MB,
-                'allowedBinaryExtensions': settings.FILE_UPLOAD_ALLOWED_EXTENSIONS,
-                'maxExtractChars': settings.FILE_UPLOAD_MAX_CHARS,
-            }
-        }
-    except Exception as e:
-        logger.error(f'Error fetching client config: {e}', exc_info=True)
-        raise HTTPException(status_code=HTTP_INTERNAL_ERROR, detail='Failed to fetch client config')

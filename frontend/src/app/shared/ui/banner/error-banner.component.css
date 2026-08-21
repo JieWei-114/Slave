@@ -27,3 +27,22 @@
     transform: translateY(0);
   }
 }
+
+.error-text {
+  flex: 1;
+}
+
+.error-dismiss {
+  background: none;
+  border: none;
+  color: var(--error-color);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  transition: background var(--transition-fast);
+}
+
+.error-dismiss:hover {
+  background: rgba(0, 0, 0, 0.08);
+}

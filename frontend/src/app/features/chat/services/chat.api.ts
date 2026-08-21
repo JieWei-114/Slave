@@ -70,7 +70,8 @@ export class ChatApi {
 
   /**
    * Stream AI response in real-time using Server-Sent Events (SSE)
-   * Uses GET request with query parameters (not POST)
+   * Uses fetch() POST with a JSON body and hand-rolled SSE parsing over
+   * the response ReadableStream. Returns a cancel function (AbortController).
    */
   streamMessage(
     sessionId: string,
@@ -82,81 +83,154 @@ export class ChatApi {
     onMetadata?: (meta: any) => void,
     onVerification?: (status: { type: string; data?: any }) => void,
     reasoningEnabled = false,
+    onError?: (err: unknown) => void,
   ): () => void {
-    const url =
-      `${this.config.apiBaseUrl}/chat/${sessionId}/stream` +
-      `?content=${encodeURIComponent(content)}` +
-      `&model=${encodeURIComponent(model)}` +
-      `&reasoning=${reasoningEnabled}`;
+    const url = `${this.config.apiBaseUrl}/chat/${sessionId}/stream`;
+    const controller = new AbortController();
+    let finished = false;
 
-    const es = new EventSource(url);
-
-    // Token streaming (answer)
-    es.addEventListener('token', (e: MessageEvent) => {
-      const token = JSON.parse(e.data);
-      onToken(token);
-    });
-
-    // Answer streaming complete
-    es.addEventListener('answer_complete', (e: MessageEvent) => {
-      if (onVerification) {
-        onVerification({ type: 'answer_complete' });
-      }
-    });
-
-    // Verification starting
-    es.addEventListener('verification_starting', (e: MessageEvent) => {
-      const data = JSON.parse(e.data);
-      if (onVerification) {
-        onVerification({ type: 'verification_starting', data });
-      }
-    });
-
-    // Verification complete
-    es.addEventListener('verification_complete', (e: MessageEvent) => {
-      const data = JSON.parse(e.data);
-      if (onVerification) {
-        onVerification({ type: 'verification_complete', data });
-      }
-    });
-
-    // Reasoning starting
-    es.addEventListener('reasoning_starting', (e: MessageEvent) => {
-      const data = JSON.parse(e.data);
-      if (onVerification) {
-        onVerification({ type: 'reasoning_starting', data });
-      }
-    });
-
-    // Reasoning tokens
-    es.addEventListener('reasoning_token', (e: MessageEvent) => {
-      const token = JSON.parse(e.data);
-      onReasoning(token);
-    });
-
-    // Done with metadata
-    es.addEventListener('done', (e: MessageEvent) => {
-      const payload = JSON.parse(e.data);
-
-      if (payload.reasoning) {
-        onReasoning(payload.reasoning);
-      }
-
-      if (payload.metadata && onMetadata) {
-        onMetadata(payload.metadata);
-      }
-
-      es.close();
-      onDone();
-    });
-
-    es.onerror = (err) => {
-      console.error('SSE error', err);
-      es.close();
+    const finishDone = () => {
+      if (finished) return;
+      finished = true;
       onDone();
     };
 
-    return () => es.close();
+    const finishError = (err: unknown) => {
+      if (finished) return;
+      finished = true;
+      console.error('SSE error', err);
+      onError?.(err);
+    };
+
+    // Dispatch a single parsed SSE event to the right callback
+    const dispatch = (eventName: string, data: string): void => {
+      const type = eventName || 'message';
+      switch (type) {
+        case 'token':
+          onToken(JSON.parse(data));
+          break;
+        case 'answer_complete':
+          onVerification?.({ type: 'answer_complete' });
+          break;
+        case 'verification_starting':
+        case 'verification_complete':
+        case 'reasoning_starting':
+          onVerification?.({ type, data: data ? JSON.parse(data) : undefined });
+          break;
+        case 'reasoning_token':
+          onReasoning(JSON.parse(data));
+          break;
+        case 'done': {
+          const payload = data ? JSON.parse(data) : {};
+          if (payload.reasoning) {
+            onReasoning(payload.reasoning);
+          }
+          if (payload.metadata && onMetadata) {
+            onMetadata(payload.metadata);
+          }
+          controller.abort();
+          finishDone();
+          break;
+        }
+        case 'error': {
+          let message = 'Stream error';
+          try {
+            const payload = data ? JSON.parse(data) : {};
+            message = payload.message ?? payload.error ?? message;
+          } catch {
+            if (data) message = data;
+          }
+          controller.abort();
+          finishError(new Error(message));
+          break;
+        }
+        case 'message':
+          // Backend fallback path sends URL-encoded plain tokens
+          if (data) onToken(decodeURIComponent(data));
+          break;
+      }
+    };
+
+    // Minimal SSE parser: handles `event:` / `data:` lines, multi-line data,
+    // and blank-line event boundaries.
+    let eventName = '';
+    let dataLines: string[] = [];
+    const processLine = (line: string): void => {
+      if (line === '') {
+        if (dataLines.length > 0 || eventName) {
+          dispatch(eventName, dataLines.join('\n'));
+        }
+        eventName = '';
+        dataLines = [];
+        return;
+      }
+      if (line.startsWith(':')) return; // comment
+      const colon = line.indexOf(':');
+      const field = colon === -1 ? line : line.slice(0, colon);
+      let value = colon === -1 ? '' : line.slice(colon + 1);
+      if (value.startsWith(' ')) value = value.slice(1);
+      if (field === 'event') {
+        eventName = value;
+      } else if (field === 'data') {
+        dataLines.push(value);
+      }
+    };
+
+    (async () => {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+        body: JSON.stringify({ content, model, reasoning: reasoningEnabled }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error(`Stream request failed: ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // If the buffer ends with '\r', defer it: it may be the first half of
+        // a CRLF split across chunks (avoids a spurious empty-line dispatch)
+        let deferredCR = '';
+        if (buffer.endsWith('\r')) {
+          deferredCR = '\r';
+          buffer = buffer.slice(0, -1);
+        }
+
+        // Split into lines; keep the last partial line in the buffer
+        let newlineIndex: number;
+        while ((newlineIndex = buffer.search(/\r\n|\n|\r/)) !== -1) {
+          const line = buffer.slice(0, newlineIndex);
+          buffer = buffer.slice(newlineIndex + (buffer.startsWith('\r\n', newlineIndex) ? 2 : 1));
+          processLine(line);
+          if (finished) return;
+        }
+        buffer += deferredCR;
+      }
+
+      // Flush any trailing event without a final blank line
+      buffer += decoder.decode();
+      if (buffer) processLine(buffer);
+      processLine('');
+      finishDone();
+    })().catch((err: unknown) => {
+      if (controller.signal.aborted) {
+        // Cancelled by user (or closed after 'done') — not an error, no callback
+        finished = true;
+        return;
+      }
+      finishError(err);
+    });
+
+    return () => controller.abort();
   }
 
   /**

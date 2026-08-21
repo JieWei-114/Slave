@@ -43,10 +43,17 @@ export class MemoryStore {
   load(sessionId: string) {
     this.currentSessionId.set(sessionId);
     this.loading.set(true);
+    this.error.set('');
 
-    this.memoryApi.getMemories(sessionId).subscribe((m) => {
-      this.memories.set(m);
-      this.loading.set(false);
+    this.memoryApi.getMemories(sessionId).subscribe({
+      next: (m) => {
+        this.memories.set(m);
+      },
+      complete: () => this.loading.set(false),
+      error: () => {
+        this.error.set('Failed to load memories');
+        this.loading.set(false);
+      },
     });
   }
 
@@ -56,10 +63,15 @@ export class MemoryStore {
   toggle(m: Memory) {
     const action = m.enabled ? this.memoryApi.disable(m.id) : this.memoryApi.enable(m.id);
 
-    action.subscribe(() => {
-      this.memories.update((list) =>
-        list.map((x) => (x.id === m.id ? { ...x, enabled: !x.enabled } : x)),
-      );
+    action.subscribe({
+      next: () => {
+        this.memories.update((list) =>
+          list.map((x) => (x.id === m.id ? { ...x, enabled: !x.enabled } : x)),
+        );
+      },
+      error: () => {
+        this.error.set(`Failed to ${m.enabled ? 'disable' : 'enable'} memory`);
+      },
     });
   }
 
@@ -67,8 +79,13 @@ export class MemoryStore {
    * Delete a memory item
    */
   delete(m: Memory) {
-    this.memoryApi.delete(m.id).subscribe(() => {
-      this.memories.update((list) => list.filter((x) => x.id !== m.id));
+    this.memoryApi.delete(m.id).subscribe({
+      next: () => {
+        this.memories.update((list) => list.filter((x) => x.id !== m.id));
+      },
+      error: () => {
+        this.error.set('Failed to delete memory');
+      },
     });
   }
 
@@ -79,9 +96,21 @@ export class MemoryStore {
     const sessionId = this.currentSessionId();
     if (!sessionId) return;
 
-    this.memoryApi.search(sessionId, q).subscribe((res) => {
-      this.memories.set(res);
+    this.loading.set(true);
+    this.memoryApi.search(sessionId, q).subscribe({
+      next: (res) => {
+        this.memories.set(res);
+      },
+      complete: () => this.loading.set(false),
+      error: () => {
+        this.error.set('Memory search failed');
+        this.loading.set(false);
+      },
     });
+  }
+
+  clearError(): void {
+    this.error.set('');
   }
 
   /**

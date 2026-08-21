@@ -6,6 +6,7 @@ Uses semantic search with embeddings for intelligent context matching
 
 """
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime
@@ -18,8 +19,9 @@ from app.core.db import (
     sessions_collection,
     synthesized_memory_collection,
 )
-from app.services.embedding_service import cosine_similarity, embed
+from app.services.embedding_service import embed
 from app.services.ollama_service import call_ollama_once
+from app.vector import get_vector_store
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,18 @@ def serialize_memory(doc: dict) -> dict:
         'category': doc.get('category', 'other'),
         'source': doc.get('source', 'manual'),
         'confidence': doc.get('confidence', settings.MEMORY_DEFAULT_CONFIDENCE),
+    }
+
+
+def _vector_payload(memory: dict) -> dict:
+    # Build the payload stored alongside the vector (Mongo stays source of truth)
+    return {
+        'session_id': memory.get('session_id'),
+        'enabled': memory.get('enabled', True),
+        'is_deprecated': memory.get('is_deprecated', False),
+        'value': memory.get('value', ''),
+        'category': memory.get('category', 'other'),
+        'source': memory.get('source', 'manual'),
     }
 
 
@@ -99,6 +113,16 @@ def add_memory(
     }
     result = synthesized_memory_collection.insert_one(memory)
     memory['_id'] = result.inserted_id
+
+    try:
+        get_vector_store().upsert(memory['id'], embedding, _vector_payload(memory))
+    except Exception as e:
+        logger.warning(f'Failed to upsert memory vector {memory["id"]}: {e}')
+        # Mark for later reconciliation so the vector store can catch up
+        synthesized_memory_collection.update_one(
+            {'_id': memory['_id']}, {'$set': {'needs_reindex': True}}
+        )
+
     return serialize_memory(memory)
 
 
@@ -123,20 +147,26 @@ def set_memory_enabled(memory_id: str, enabled: bool):
     Disabled memories are not returned in searches or context selection.
 
     """
-    result = synthesized_memory_collection.update_one(
-        {'id': memory_id}, {'$set': {'enabled': enabled}}
-    )
-    if result.matched_count == 0:
+    # Resolve the doc first so we can propagate the uuid 'id' (not the Mongo
+    # _id hex string) to the vector store — Qdrant point ids are the uuid.
+    doc = synthesized_memory_collection.find_one({'id': memory_id})
+    if doc is None:
         try:
-            oid = ObjectId(memory_id)
-            result = synthesized_memory_collection.update_one(
-                {'_id': oid}, {'$set': {'enabled': enabled}}
-            )
+            doc = synthesized_memory_collection.find_one({'_id': ObjectId(memory_id)})
         except InvalidId:
-            result = None
+            doc = None
 
-    if not result or result.matched_count == 0:
+    if doc is None:
         raise ValueError('Invalid memory id')
+
+    synthesized_memory_collection.update_one({'_id': doc['_id']}, {'$set': {'enabled': enabled}})
+
+    # Propagate to the vector store (no-op for Mongo)
+    vector_id = doc.get('id') or str(doc['_id'])
+    try:
+        get_vector_store().set_enabled(vector_id, enabled)
+    except Exception as e:
+        logger.warning(f'Failed to update vector enabled flag for {vector_id}: {e}')
 
 
 def list_enabled_memories(chat_sessionId: str):
@@ -180,13 +210,26 @@ def delete_memory(memory_id: str):
     Permanently delete a memory item.
 
     """
-    result = synthesized_memory_collection.delete_one({'id': memory_id})
-    if result.deleted_count == 0:
+    # Resolve the doc first so we can propagate the uuid 'id' (not the Mongo
+    # _id hex string) to the vector store — Qdrant point ids are the uuid.
+    doc = synthesized_memory_collection.find_one({'id': memory_id})
+    if doc is None:
         try:
-            oid = ObjectId(memory_id)
-            result = synthesized_memory_collection.delete_one({'_id': oid})
+            doc = synthesized_memory_collection.find_one({'_id': ObjectId(memory_id)})
         except InvalidId:
             raise ValueError('Invalid memory id')
+
+    if doc is None:
+        raise ValueError('Invalid memory id')
+
+    synthesized_memory_collection.delete_one({'_id': doc['_id']})
+
+    # Propagate to the vector store (no-op for Mongo)
+    vector_id = doc.get('id') or str(doc['_id'])
+    try:
+        get_vector_store().delete(vector_id)
+    except Exception as e:
+        logger.warning(f'Failed to delete vector for memory {vector_id}: {e}')
 
 
 def delete_memories_for_session(chat_sessionId: str) -> int:
@@ -197,7 +240,58 @@ def delete_memories_for_session(chat_sessionId: str) -> int:
 
     """
     result = synthesized_memory_collection.delete_many({'session_id': chat_sessionId})
+
+    # Propagate to the vector store (no-op for Mongo)
+    try:
+        get_vector_store().delete_by_session(chat_sessionId)
+    except Exception as e:
+        logger.warning(f'Failed to delete vectors for session {chat_sessionId}: {e}')
+
     return result.deleted_count
+
+
+def reindex_memories() -> int:
+    """
+    Reconcile the vector store with Mongo (source of truth).
+
+    Iterates all enabled, non-deprecated memories, re-upserting each into the
+    vector store (re-embedding only when no embedding is stored) and clearing
+    any needs_reindex flag. Returns the number of memories reindexed.
+
+    """
+    store = get_vector_store()
+    count = 0
+
+    cursor = synthesized_memory_collection.find(
+        {
+            'is_deprecated': {'$ne': True},
+            '$or': [{'enabled': True}, {'enabled': {'$exists': False}}],
+        }
+    )
+
+    for doc in cursor:
+        vector_id = doc.get('id') or str(doc['_id'])
+        try:
+            embedding = doc.get('embedding')
+            if not embedding:
+                content = doc.get('value') or doc.get('content') or doc.get('fact') or ''
+                if not content.strip():
+                    continue
+                embedding = embed([content])[0]
+                synthesized_memory_collection.update_one(
+                    {'_id': doc['_id']}, {'$set': {'embedding': embedding}}
+                )
+
+            store.upsert(vector_id, embedding, _vector_payload(doc))
+            synthesized_memory_collection.update_one(
+                {'_id': doc['_id']}, {'$unset': {'needs_reindex': ''}}
+            )
+            count += 1
+        except Exception as e:
+            logger.warning(f'Failed to reindex memory {vector_id}: {e}')
+
+    logger.info('Memory reindex complete: %s memories upserted', count)
+    return count
 
 
 def search_memories(chat_sessionId: str, query: str, limit: int = None, threshold: float = None):
@@ -237,20 +331,31 @@ def search_memories(chat_sessionId: str, query: str, limit: int = None, threshol
         logger.error(f'Failed to embed query: {e}')
         return []
 
-    cursor = synthesized_memory_collection.find(
-        {
-            'session_id': chat_sessionId,
-            'is_deprecated': {'$ne': True},
-            '$or': [{'enabled': True}, {'enabled': {'$exists': False}}],
-            'embedding': {'$exists': True},
-        }
-    ).limit(MEMORY_DB_QUERY_LIMIT)
+    try:
+        hits = get_vector_store().search(
+            query_vec,
+            limit=MEMORY_DB_QUERY_LIMIT,
+            filter={'session_id': chat_sessionId},
+        )
+    except Exception as e:
+        logger.error(f'Vector search failed: {e}')
+        return []
 
     scored = []
-    for doc in cursor:
+    for hit in hits:
         try:
-            score = cosine_similarity(query_vec, doc['embedding'])
+            score = hit['score']
             if score >= threshold:
+                doc = hit.get('payload') or {}
+                if '_id' not in doc:
+                    # Payload-only hit (e.g. Qdrant) — hydrate from Mongo (source of truth)
+                    doc = synthesized_memory_collection.find_one({'id': hit['id']}) or doc
+
+                # Re-check Mongo truth: skip disabled/deprecated memories the
+                # vector store may not have caught up on yet
+                if not doc.get('enabled', True) or doc.get('is_deprecated'):
+                    continue
+
                 # Truncate content to max chars per item
                 content = doc.get('value') or doc.get('content', '')
                 if len(content) > MAX_CHARS_PER_ITEM:
@@ -293,21 +398,36 @@ Memories:
 {text}
 """
 
+    # 1. Get the summary FIRST — never touch existing memories until we know
+    #    we have a valid replacement.
     try:
         summary = await call_ollama_once(prompt, model)
     except Exception:
+        logger.error('Memory compression failed: LLM call raised — nothing was modified')
         return None
 
-    # Disable old memories after successful compression
-    for m in memories:
-        set_memory_enabled(m['id'], False)
+    if not summary or not summary.strip():
+        # call_ollama_once returns '' on failure — abort without disabling anything
+        logger.error('Memory compression failed: empty summary — nothing was modified')
+        return None
 
-    return add_memory(
-        content=summary,
-        chat_sessionId=chat_sessionId,
-        source='compress',
-        category='other',
+    # 2. Insert the new compressed memory first
+    compressed = await asyncio.to_thread(
+        add_memory,
+        summary,
+        chat_sessionId,
+        'compress',
+        'other',
     )
+
+    # 3. Only disable old memories AFTER the compressed memory is safely stored
+    for m in memories:
+        try:
+            await asyncio.to_thread(set_memory_enabled, m['id'], False)
+        except Exception as e:
+            logger.warning(f'Failed to disable old memory {m["id"]}: {e}')
+
+    return compressed
 
 
 def should_remember(user_text: str, assistant_text: str) -> bool:
@@ -332,7 +452,8 @@ def should_remember(user_text: str, assistant_text: str) -> bool:
     if any(pattern in normalized for pattern in accept_patterns):
         return True
 
-    return True
+    # Default: do NOT remember unless a pattern/heuristic indicated we should
+    return False
 
 
 async def summarize(text: str, model: str) -> str:
@@ -366,11 +487,13 @@ async def auto_memory_if_needed(
     summary = await summarize(combined, model)
 
     try:
-        return add_memory(
-            content=summary,
-            chat_sessionId=chat_sessionId,
-            source='auto',
-            category='preference_or_fact',
+        # add_memory does blocking embedding + Mongo work — keep it off the event loop
+        return await asyncio.to_thread(
+            add_memory,
+            summary,
+            chat_sessionId,
+            'auto',
+            'preference_or_fact',
         )
     except Exception as e:
         logger.error(f'Failed to add auto memory: {e}')
@@ -400,7 +523,8 @@ async def add_synthesized_memory(
     embedding = None
     try:
         if fact and fact.strip():
-            embedding = embed([fact])[0]
+            # Blocking sentence-transformers call — run off the event loop
+            embedding = (await asyncio.to_thread(embed, [fact]))[0]
     except Exception as e:
         logger.warning(f'Failed to embed synthesized memory: {e}')
 
@@ -425,8 +549,27 @@ async def add_synthesized_memory(
     if source_file:
         memory_item['source_file'] = source_file
 
-    result = synthesized_memory_collection.insert_one(memory_item)
+    result = await asyncio.to_thread(synthesized_memory_collection.insert_one, memory_item)
     memory_item['_id'] = result.inserted_id
+
+    if embedding is not None:
+        try:
+            # Blocking vector store call — run off the event loop
+            await asyncio.to_thread(
+                get_vector_store().upsert,
+                memory_item['id'],
+                embedding,
+                _vector_payload(memory_item),
+            )
+        except Exception as e:
+            logger.warning(f'Failed to upsert synthesized memory vector {memory_item["id"]}: {e}')
+            # Mark for later reconciliation so the vector store can catch up
+            await asyncio.to_thread(
+                synthesized_memory_collection.update_one,
+                {'_id': memory_item['_id']},
+                {'$set': {'needs_reindex': True}},
+            )
+
     logger.info(
         f'Synthesized memory added: {fact[:MEMORY_LOG_TRUNCATION_LIMIT]}... (confidence: {confidence})'
     )

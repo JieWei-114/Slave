@@ -3,18 +3,25 @@ Main application entry point
 Sets up FastAPI app with CORS, routers, and health checks
 """
 
+import asyncio
 import logging
 import os
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.chat import router as chat_router
 from app.api.memory import router as memory_router
+from app.api.models import router as models_router
 from app.api.rules import router as rule_router
+from app.api.voice import router as voice_router
 from app.api.web import router as web_router
 from app.config.settings import settings
+from app.core.auth import require_api_key
 from app.core.db import client
+from app.services.memory_service import reindex_memories
+
+logger = logging.getLogger(__name__)
 
 # Configure logging level from environment
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'DEBUG').upper()
@@ -30,16 +37,43 @@ logging.getLogger('httpcore').setLevel(logging.WARNING)
 logging.getLogger('httpx').setLevel(logging.WARNING)
 
 # Initialize FastAPI application
-app = FastAPI(title='My Slave', version='1.0.0')
+app = FastAPI(title='Slave', version='1.0.0')
 
-# Enable CORS for frontend communication
+# Enable CORS for frontend communication.
+# Never fall back to '*' — if CORS_ORIGINS is unset, use explicit localhost
+# dev origins. allow_credentials is False because no cookies are used.
+DEFAULT_DEV_ORIGINS = [
+    'http://localhost:4200',
+    'http://localhost:4000',
+    'http://localhost:4173',
+    # Tauri desktop shell (packaged app origins)
+    'tauri://localhost',
+    'http://tauri.localhost',
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS or ['*'],
-    allow_credentials=True,
+    allow_origins=settings.CORS_ORIGINS or DEFAULT_DEV_ORIGINS,
+    allow_credentials=False,
     allow_methods=['*'],
     allow_headers=['*'],
 )
+
+
+async def _reindex_vector_store() -> None:
+    """Reconcile the vector store with Mongo without blocking startup."""
+    try:
+        count = await asyncio.to_thread(reindex_memories)
+        logger.info('Startup vector reindex done: %s memories upserted', count)
+    except Exception as e:
+        logger.warning('Startup vector reindex failed: %s', e)
+
+
+@app.on_event('startup')
+async def startup_vector_reindex():
+    # Only needed for external vector stores (Mongo store reads embeddings
+    # straight from the source-of-truth collection)
+    if (settings.VECTOR_STORE or 'mongo').strip().lower() != 'mongo':
+        asyncio.create_task(_reindex_vector_store())
 
 
 @app.get('/')
@@ -65,8 +99,10 @@ async def health_check():
     }
 
 
-# Register API routers
-app.include_router(chat_router)  # Chat sessions and streaming
-app.include_router(memory_router)  # Memory management
-app.include_router(web_router)  # Web search
-app.include_router(rule_router)  # Rules configuration
+# Register API routers (all protected by optional API-key auth)
+app.include_router(chat_router, dependencies=[Depends(require_api_key)])  # Chat sessions and streaming
+app.include_router(memory_router, dependencies=[Depends(require_api_key)])  # Memory management
+app.include_router(web_router, dependencies=[Depends(require_api_key)])  # Web search
+app.include_router(rule_router, dependencies=[Depends(require_api_key)])  # Rules configuration
+app.include_router(models_router, dependencies=[Depends(require_api_key)])  # HF model search + Ollama pull
+app.include_router(voice_router, dependencies=[Depends(require_api_key)])  # Local voice STT + TTS

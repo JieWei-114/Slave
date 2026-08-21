@@ -4,19 +4,26 @@ import { FormsModule } from '@angular/forms';
 
 import { ChatMessage } from '../../../features/chat/services/chat.model';
 import { ChatStore } from '../../../features/chat/store/chat.store';
+import { VoiceApi } from '../../../features/chat/services/voice.api';
+import { VoicePlaybackService } from '../../../features/chat/services/voice-playback.service';
 import { AutoResizeTextareaDirective } from '../../directives/auto-resize-textarea.directive';
 import { ContextIndicatorComponent } from '../context-indicator/context-indicator.component';
+import { MarkdownPipe } from '../../pipes/markdown.pipe';
 
 @Component({
   selector: 'app-chat-message-bubble',
   standalone: true,
-  imports: [CommonModule, FormsModule, AutoResizeTextareaDirective, ContextIndicatorComponent],
+  imports: [
+    CommonModule,
+    FormsModule,
+    AutoResizeTextareaDirective,
+    ContextIndicatorComponent,
+    MarkdownPipe,
+  ],
   templateUrl: './chat-message-buble.component.html',
   styleUrls: ['./chat-message-buble.component.css'],
 })
 export class ChatMessageBubbleComponent implements OnChanges {
-  private static reasoningStateByMessage = new Map<string, boolean>();
-  private static metadataStateByMessage = new Map<string, boolean>();
   @Input() message!: ChatMessage;
   @Input() isLastUserMessage = false;
 
@@ -36,7 +43,11 @@ export class ChatMessageBubbleComponent implements OnChanges {
   private previousReasoningLength = 0;
   private messageKey = '';
 
-  constructor(private store: ChatStore) {}
+  constructor(
+    private store: ChatStore,
+    private voiceApi: VoiceApi,
+    private voicePlayback: VoicePlaybackService,
+  ) {}
 
   ngOnChanges(changes: SimpleChanges): void {
     if (!changes['message']) return;
@@ -45,10 +56,8 @@ export class ChatMessageBubbleComponent implements OnChanges {
 
     if (nextKey && nextKey !== this.messageKey) {
       // Reset per-message UI state when a different message is bound.
-      const saved = ChatMessageBubbleComponent.reasoningStateByMessage.get(nextKey);
-      this.showReasoning = saved ?? false;
-      this.manuallyToggled = saved !== undefined;
-      // const savedMetadata = ChatMessageBubbleComponent.metadataStateByMessage.get(nextKey);
+      this.showReasoning = false;
+      this.manuallyToggled = false;
       this.showMetadata = false;
       this.previousReasoningLength = 0;
       this.messageKey = nextKey;
@@ -77,16 +86,10 @@ export class ChatMessageBubbleComponent implements OnChanges {
   toggleReasoning(): void {
     this.showReasoning = !this.showReasoning;
     this.manuallyToggled = true; // Mark as manually toggled to prevent auto-opening
-    if (this.messageKey) {
-      ChatMessageBubbleComponent.reasoningStateByMessage.set(this.messageKey, this.showReasoning);
-    }
   }
 
   toggleMetadata(): void {
     this.showMetadata = !this.showMetadata;
-    if (this.messageKey) {
-      ChatMessageBubbleComponent.metadataStateByMessage.set(this.messageKey, this.showMetadata);
-    }
   }
 
   remember(): void {
@@ -138,5 +141,62 @@ export class ChatMessageBubbleComponent implements OnChanges {
 
   get isReasoningEnabled(): boolean {
     return this.store.reasoningEnabled();
+  }
+
+  /**
+   * Voice output (text-to-speech)
+   */
+  private get voiceKey(): string {
+    return `${this.message?.role}|${this.message?.created_at}`;
+  }
+
+  get canSpeak(): boolean {
+    return (
+      this.isAssistant &&
+      this.voiceApi.ttsEnabled() &&
+      !!this.message?.content &&
+      !this.store.loading() // hide while the response is still streaming
+    );
+  }
+
+  get isSpeaking(): boolean {
+    return this.voicePlayback.playingKey() === this.voiceKey;
+  }
+
+  get isSpeakLoading(): boolean {
+    return this.voicePlayback.loadingKey() === this.voiceKey;
+  }
+
+  /** True while a slow first-time speak is likely downloading the voice model */
+  isSpeakDownloadHint = false;
+  private speakHintTimer: ReturnType<typeof setTimeout> | null = null;
+
+  get speakTitle(): string {
+    if (this.isSpeakLoading && this.isSpeakDownloadHint) return 'Downloading voice model…';
+    if (this.isSpeaking) return 'Stop playback';
+    if (!this.voiceApi.ttsReady()) return 'First use will download the voice model (~30s)';
+    return 'Read message aloud';
+  }
+
+  toggleSpeak(): void {
+    if (!this.message?.content) return;
+
+    // Flip a hint after 3s: a long first fetch means the model is downloading
+    this.clearSpeakHintTimer();
+    this.speakHintTimer = setTimeout(() => {
+      this.isSpeakDownloadHint = true;
+    }, 3000);
+
+    void this.voicePlayback.toggle(this.voiceKey, this.message.content).finally(() => {
+      this.clearSpeakHintTimer();
+      this.isSpeakDownloadHint = false;
+    });
+  }
+
+  private clearSpeakHintTimer(): void {
+    if (this.speakHintTimer) {
+      clearTimeout(this.speakHintTimer);
+      this.speakHintTimer = null;
+    }
   }
 }

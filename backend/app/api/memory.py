@@ -3,6 +3,7 @@ Memory API
 
 """
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException, Query
@@ -14,6 +15,7 @@ from app.services.memory_service import (
     compress_memories,
     delete_memory,
     list_all_memories,
+    reindex_memories,
     search_memories,
     set_memory_enabled,
 )
@@ -127,6 +129,23 @@ def search(
     except Exception as e:
         logger.error('Failed to search memories: %s', e, exc_info=True)
         raise HTTPException(status_code=HTTP_INTERNAL_ERROR, detail='Failed to search memories')
+
+
+@router.post('/reindex')
+async def reindex():
+    """
+    Reconcile the vector store with Mongo (manual trigger).
+
+    Re-upserts all enabled, non-deprecated memories into the vector store.
+
+    """
+    try:
+        logger.info('Manual memory reindex triggered')
+        count = await asyncio.to_thread(reindex_memories)
+        return {'reindexed': count}
+    except Exception as e:
+        logger.error('Failed to reindex memories: %s', e, exc_info=True)
+        raise HTTPException(status_code=HTTP_INTERNAL_ERROR, detail='Failed to reindex memories')
 
 
 @router.post('/compress')

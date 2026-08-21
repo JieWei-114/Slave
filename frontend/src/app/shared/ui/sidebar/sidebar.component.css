@@ -194,3 +194,8 @@
 .menu-dropdown button.delete-opt {
   color: red;
 }
+
+.delete-opt.confirming {
+  background: var(--error-color);
+  color: white;
+}

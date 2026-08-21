@@ -6,6 +6,7 @@
   <ng-container *ngIf="!collapsed">
     <button class="new" (click)="newSession.emit()">New Chat</button>
     <button class="memory" [class.active]="showTools" (click)="toggleTools.emit()">Tools</button>
+    <button class="memory" routerLink="/models" routerLinkActive="active">Models</button>
 
     <div class="session-container" cdkDropList (cdkDropListDropped)="onDrop($event)">
       <ng-container *ngIf="sessions.length; else empty">
@@ -38,9 +39,10 @@
               <button (click)="startEdit(s); $event.stopPropagation()">Rename</button>
               <button
                 class="delete-opt"
-                (click)="deleteSession.emit(s.id); $event.stopPropagation()"
+                [class.confirming]="confirmingDeleteId === s.id"
+                (click)="requestDelete(s.id, $event)"
               >
-                Delete
+                {{ confirmingDeleteId === s.id ? 'Delete? ✓' : 'Delete' }}
               </button>
             </div>
           </div>

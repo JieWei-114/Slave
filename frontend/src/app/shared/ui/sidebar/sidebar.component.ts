@@ -1,13 +1,14 @@
 import { Component, EventEmitter, Input, Output, HostListener } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
+import { RouterLink, RouterLinkActive } from '@angular/router';
 import { ChatSession } from '../../../features/chat/services/chat.model';
 import { DragDropModule, CdkDragDrop, moveItemInArray } from '@angular/cdk/drag-drop';
 
 @Component({
   selector: 'app-sidebar',
   standalone: true,
-  imports: [CommonModule, FormsModule, DragDropModule],
+  imports: [CommonModule, FormsModule, DragDropModule, RouterLink, RouterLinkActive],
   templateUrl: './sidebar.component.html',
   styleUrls: ['./sidebar.component.css'],
 })
@@ -30,6 +31,25 @@ export class SidebarComponent {
   editingId: string | null = null;
   menuOpenId: string | null = null;
   draftTitle = '';
+
+  /** Two-click delete confirmation: id of the session pending confirmation */
+  confirmingDeleteId: string | null = null;
+  private confirmTimer: ReturnType<typeof setTimeout> | null = null;
+
+  requestDelete(id: string, event: Event): void {
+    event.stopPropagation();
+    if (this.confirmingDeleteId === id) {
+      if (this.confirmTimer) clearTimeout(this.confirmTimer);
+      this.confirmingDeleteId = null;
+      this.menuOpenId = null;
+      this.deleteSession.emit(id);
+      return;
+    }
+    this.confirmingDeleteId = id;
+    if (this.confirmTimer) clearTimeout(this.confirmTimer);
+    // Auto-reset the confirmation after a few seconds
+    this.confirmTimer = setTimeout(() => (this.confirmingDeleteId = null), 3000);
+  }
 
   startEdit(session: ChatSession): void {
     this.editingId = session.id;
