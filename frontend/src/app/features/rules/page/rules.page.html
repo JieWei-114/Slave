@@ -257,6 +257,27 @@
       </div>
     </div>
 
+    <!-- AI Behavior Section -->
+    <div class="rules-section yellow">
+      <h3>AI Behavior</h3>
+      <p class="section-description">Control how the model responds in this session</p>
+
+      <div class="rule-item">
+        <div class="rule-info">
+          <span class="rule-name">Reasoning</span>
+          <span class="rule-desc">Show the model's thinking process</span>
+        </div>
+        <label class="toggle-switch">
+          <input
+            type="checkbox"
+            [checked]="chatStore.reasoningEnabled()"
+            (change)="chatStore.toggleReasoning()"
+          />
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+
     <!-- Custom Instructions Section -->
     <div class="rules-section lite-yellow">
       <h3>Custom AI Instructions</h3>

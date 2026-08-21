@@ -112,6 +112,8 @@ export interface ChatSession {
   title: string; // Session title (editable)
   messages: ChatMessage[]; // Array of messages in conversation
   rules?: RulesConfig; // Session-specific rules configuration
+  topic_break_at?: string; // ISO timestamp of the latest topic break (New Topic)
+  topic_summary?: string; // Brief summary of the discussion before the break
   isTemp?: boolean; // True for local-only sessions not yet persisted to backend
   hasMore?: boolean; // Flag for pagination (more messages available)
   loadingMore?: boolean; // Loading state for pagination
@@ -126,6 +128,8 @@ export interface ChatSessionDto {
   id: string;
   title: string;
   updated_at: string; // ISO timestamp
+  topic_break_at?: string; // ISO timestamp of the latest topic break
+  topic_summary?: string; // Brief summary of the discussion before the break
 }
 
 /**

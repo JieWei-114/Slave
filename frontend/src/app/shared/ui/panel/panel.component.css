@@ -1,9 +1,17 @@
+/* fixed default width lives on the host — the same element the drag-resize
+   writes its inline width to, so user resize overrides it */
+:host {
+  display: block;
+  width: 440px;
+  min-width: 390px;
+  max-width: 600px;
+}
+
 .panel {
   display: flex;
   flex-direction: column;
   height: 100%;
-  min-width: 390px;
-  max-width: 600px;
+  width: 100%;
 }
 
 .panel-tabs {

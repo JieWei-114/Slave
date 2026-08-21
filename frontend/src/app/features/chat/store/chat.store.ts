@@ -92,11 +92,14 @@ export class ChatStore {
     return id ? (this.sessions()[id] ?? null) : null;
   });
 
-  // Get follow-up status from current session's rules (default: false)
+  // Get follow-up status from current session's rules (default: true — server default)
   readonly followUpEnabled = computed(() => {
     const session = this.currentSession();
-    return session?.rules?.followUpEnabled ?? false;
+    return session?.rules?.followUpEnabled ?? true;
   });
+
+  // Loading state for the "New Topic" request
+  readonly newTopicLoading = signal(false);
 
   // Get reasoning status from current session's rules (default: false)
   readonly reasoningEnabled = computed(() => {
@@ -113,6 +116,36 @@ export class ChatStore {
 
   // Can only send if not loading and session exists
   readonly canSendMessage = computed(() => !this.loading() && this.currentSessionId() !== null);
+
+  // Index of the first message after the latest topic break (-1 if no break).
+  // If the break is after every message (fresh break), the divider goes at
+  // the end of the list (index === messages.length).
+  readonly topicDividerIndex = computed(() => {
+    const session = this.currentSession();
+    const breakAt = session?.topic_break_at;
+    if (!breakAt) return -1;
+    const messages = session?.messages ?? [];
+    if (!messages.length) return -1;
+    const breakTime = new Date(breakAt).getTime();
+    const index = messages.findIndex((m) => new Date(m.created_at).getTime() > breakTime);
+    return index === -1 ? messages.length : index;
+  });
+
+  // "New Topic" is allowed when a persisted session with messages is idle and
+  // the last thing in the session is not already a topic break
+  readonly canStartNewTopic = computed(() => {
+    const session = this.currentSession();
+    if (!session || session.isTemp) return false;
+    if (this.loading() || this.newTopicLoading()) return false;
+    const messages = session.messages;
+    if (!messages.length) return false;
+    if (session.topic_break_at) {
+      const breakTime = new Date(session.topic_break_at).getTime();
+      const lastTime = new Date(messages[messages.length - 1].created_at).getTime();
+      if (lastTime <= breakTime) return false; // nothing after the last break
+    }
+    return true;
+  });
 
   /**
    * Sidebar Helper
@@ -271,6 +304,38 @@ export class ChatStore {
   }
 
   /**
+   * Start a new topic in the current session: the backend summarises the
+   * conversation so far and future messages only carry a brief overview.
+   */
+  startNewTopic(): void {
+    const session = this.currentSession();
+    if (!session || !this.canStartNewTopic()) return;
+
+    this.newTopicLoading.set(true);
+    this.error.set('');
+
+    this.chatApi.newTopic(session.id, this.currentModel().id).subscribe({
+      next: (res: { topic_break_at: string; summary: string }) => {
+        this.log(`New topic started for session ${session.id}`);
+        this.sessions.update((s: Record<string, ChatSession>) => ({
+          ...s,
+          [session.id]: {
+            ...s[session.id],
+            topic_break_at: res.topic_break_at,
+            topic_summary: res.summary,
+          },
+        }));
+        this.newTopicLoading.set(false);
+      },
+      error: (err: unknown) => {
+        this.logError(`Failed to start new topic: ${err}`);
+        this.error.set('Failed to start a new topic');
+        this.newTopicLoading.set(false);
+      },
+    });
+  }
+
+  /**
    * Store metadata from the last AI response
    */
   setLastMessageMetadata(metadata: MessageMetadata): void {
@@ -322,6 +387,8 @@ export class ChatStore {
               title: s.title,
               messages: prev?.messages ?? [], // Messages loaded lazily when session is selected
               isTemp: false,
+              topic_break_at: s.topic_break_at ?? prev?.topic_break_at,
+              topic_summary: s.topic_summary ?? prev?.topic_summary,
             };
           }
           return map;

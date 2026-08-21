@@ -31,6 +31,7 @@ from app.services.chat_service import (
     rename_session,
     stream_chat_reply,
 )
+from app.services.ollama_service import call_ollama_once
 from app.services.file_extraction_service import (
     delete_file_attachment_for_session,
     extract_text_from_file,
@@ -181,6 +182,102 @@ async def stream_message(session_id: str, payload_in: StreamMessageRequest):
     except Exception as e:
         logger.error(f'Failed to stream message for session {session_id}: {e}')
         raise HTTPException(status_code=HTTP_INTERNAL_ERROR, detail='Failed to stream message')
+
+
+class NewTopicRequest(BaseModel):
+    """JSON body for the new-topic endpoint."""
+
+    model: str
+
+
+NEW_TOPIC_MAX_MESSAGES = 30
+NEW_TOPIC_MAX_INPUT_CHARS = 4000
+NEW_TOPIC_SUMMARY_PROMPT = (
+    'Summarize what this conversation has covered so far in 3-5 sentences. '
+    'Focus on topics, decisions, and key facts.\n\nConversation:\n{conversation}'
+)
+
+
+def _fallback_topic_summary(messages: list) -> str:
+    """Extractive fallback summary: first line of each of the last 5 user messages."""
+    user_lines = []
+    for msg in messages:
+        if msg.get('role') != 'user':
+            continue
+        content = (msg.get('content') or '').strip()
+        if not content:
+            continue
+        user_lines.append(content.splitlines()[0][:200])
+    lines = user_lines[-5:]
+    if not lines:
+        return 'Earlier conversation before the topic change.'
+    return 'Earlier conversation covered: ' + ' | '.join(lines)
+
+
+@router.post('/{session_id}/new-topic')
+async def start_new_topic(session_id: str, payload: NewTopicRequest):
+    """
+    Mark a topic break in the session.
+
+    Summarizes the conversation so far, stores the summary and break
+    timestamp on the session; context building only considers messages
+    after the break (plus the stored overview summary).
+
+    """
+    try:
+        session = sessions_collection.find_one({'id': session_id}, {'_id': 0, 'messages': 1})
+        if not session:
+            raise HTTPException(status_code=HTTP_NOT_FOUND, detail='Session not found')
+
+        messages = session.get('messages', [])
+        if not messages:
+            raise HTTPException(
+                status_code=HTTP_BAD_REQUEST, detail='Session has no messages to summarize'
+            )
+
+        messages = sorted(messages, key=lambda m: m['created_at'])[-NEW_TOPIC_MAX_MESSAGES:]
+
+        conversation = '\n'.join(
+            f'{msg.get("role", "").upper()}: {msg.get("content", "")}' for msg in messages
+        )
+        if len(conversation) > NEW_TOPIC_MAX_INPUT_CHARS:
+            # Keep the most recent part of the conversation
+            conversation = '[...]\n' + conversation[-NEW_TOPIC_MAX_INPUT_CHARS:]
+
+        summary = ''
+        try:
+            summary = await call_ollama_once(
+                prompt=NEW_TOPIC_SUMMARY_PROMPT.format(conversation=conversation),
+                model=payload.model,
+            )
+            summary = (summary or '').strip()
+        except Exception as e:
+            logger.warning(f'Topic summary generation failed for {session_id}: {e}')
+
+        if not summary:
+            summary = _fallback_topic_summary(messages)
+            logger.info(f'Using fallback topic summary for session {session_id}')
+
+        # Same datetime format as message created_at so comparisons work
+        topic_break_at = datetime.utcnow()
+        sessions_collection.update_one(
+            {'id': session_id},
+            {
+                '$set': {
+                    'topic_break_at': topic_break_at,
+                    'topic_summary': summary,
+                    'updated_at': topic_break_at,
+                }
+            },
+        )
+
+        logger.info(f'New topic started for session {session_id} at {topic_break_at.isoformat()}')
+        return {'topic_break_at': topic_break_at.isoformat(), 'summary': summary}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f'Failed to start new topic for session {session_id}: {e}')
+        raise HTTPException(status_code=HTTP_INTERNAL_ERROR, detail='Failed to start new topic')
 
 
 @router.get('/{session_id}/messages')

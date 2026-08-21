@@ -13,7 +13,7 @@ class SessionRules(BaseModel):
     serper: bool = False
     tavilyExtract: bool = False
     localExtract: bool = True
-    followUpEnabled: bool = False
+    followUpEnabled: bool = True
     reasoningEnabled: bool = False
 
 
@@ -24,6 +24,8 @@ class ChatSession(BaseModel):
     created_at: datetime
     updated_at: datetime
     rules: SessionRules = Field(default_factory=SessionRules)
+    topic_break_at: datetime | None = None
+    topic_summary: str | None = None
 
 
 class AssistantMeta(BaseModel):

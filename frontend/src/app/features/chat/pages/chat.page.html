@@ -42,12 +42,40 @@
 
     <!-- Messages -->
     <div class="messages-container" *ngIf="store.hasMessages()">
-      <app-chat-message-bubble
+      <ng-template #topicDivider>
+        <div
+          class="topic-divider"
+          [class.expandable]="!!store.currentSession()?.topic_summary"
+          (click)="toggleTopicSummary()"
+        >
+          <span class="topic-divider-line"></span>
+          <span class="topic-divider-text">— New topic —</span>
+          <span class="topic-divider-line"></span>
+        </div>
+        <div class="topic-summary" *ngIf="showTopicSummary()">
+          {{ store.currentSession()?.topic_summary }}
+        </div>
+      </ng-template>
+
+      <ng-container
         *ngFor="let msg of store.messageList(); let i = index; trackBy: trackByMessage"
-        [message]="msg"
-        [isLastUserMessage]="isLastUserMessage(msg, i)"
-        (editAndResend)="onEditAndResend($event.content, $event.attachment)"
-      />
+      >
+        <ng-container
+          *ngIf="i === store.topicDividerIndex()"
+          [ngTemplateOutlet]="topicDivider"
+        ></ng-container>
+        <app-chat-message-bubble
+          [message]="msg"
+          [isLastUserMessage]="isLastUserMessage(msg, i)"
+          (editAndResend)="onEditAndResend($event.content, $event.attachment)"
+        />
+      </ng-container>
+
+      <!-- Fresh topic break with no messages after it yet: divider at the end -->
+      <ng-container
+        *ngIf="store.topicDividerIndex() === store.messageList().length"
+        [ngTemplateOutlet]="topicDivider"
+      ></ng-container>
 
       <div class="typing-indicator" *ngIf="isTyping">
         <span class="dot"></span>
@@ -61,30 +89,18 @@
   <app-error-banner [message]="store.error()" [dismissible]="true" (dismiss)="dismissError()" />
 
   <div class="chat-input-wrapper">
-    <div class="chat-button-wrapper">
-      <button
-        class="header-toggle-btn"
-        [class.active]="store.followUpEnabled()"
-        (click)="store.toggleFollowUp()"
-        [attr.aria-pressed]="store.followUpEnabled()"
-        title="Toggle follow-up context"
-        aria-label="Toggle follow-up context"
-      >
-        Follow-UP
-      </button>
-
-      <button
-        class="header-toggle-btn"
-        [class.active]="store.reasoningEnabled()"
-        (click)="store.toggleReasoning()"
-        [attr.aria-pressed]="store.reasoningEnabled()"
-        title="Toggle reasoning generation"
-        aria-label="Toggle reasoning generation"
-      >
-        Reasoning
-      </button>
-    </div>
     <div class="chat-input">
+      <app-button
+        class="btn-new-topic"
+        title="Start a new topic — the AI keeps only a brief overview of earlier discussion"
+        aria-label="Start a new topic — the AI keeps only a brief overview of earlier discussion"
+        (click)="store.startNewTopic()"
+        [disabled]="!store.canStartNewTopic()"
+        [loading]="store.newTopicLoading()"
+      >
+        ✂
+      </app-button>
+
       <div class="file-input-wrapper">
         <input
           #fileInput

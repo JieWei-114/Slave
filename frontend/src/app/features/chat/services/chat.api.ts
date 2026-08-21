@@ -62,6 +62,17 @@ export class ChatApi {
   }
 
   /**
+   * Start a new topic in a session — the backend summarises earlier
+   * discussion and marks a topic break. 400 if the session has no messages.
+   */
+  newTopic(sessionId: string, model: string) {
+    return this.http.post<{ topic_break_at: string; summary: string }>(
+      `${this.config.apiBaseUrl}/chat/${sessionId}/new-topic`,
+      { model },
+    );
+  }
+
+  /**
    * Reorder chat sessions (for sidebar drag-and-drop)
    */
   reorderSessions(sessionIds: string[]) {

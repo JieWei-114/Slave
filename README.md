@@ -1,332 +1,147 @@
-# Slave – Advanced Local AI Assistant Platform
+# Slave
 
-**Your data. Your AI. Your rules.** A AI assistant platform engineered for privacy, reliability, and transparency. Built on Angular 21 + FastAPI + MongoDB with intelligent multi-source reasoning, real-time streaming, and zero-hallucination architecture.
+A local-first AI assistant — built as a learning project to explore full-stack AI application development.
 
+This is a self-hosted chat assistant that runs on Ollama, with retrieval-augmented generation (RAG), semantic memory, local voice input/output, and an optional desktop shell. I built it as a solo project to learn how the pieces of a modern AI application fit together: streaming inference, context assembly, vector search, provider abstractions, and a reactive frontend. It works, but it is experimental: single-user by design, no automated test suite yet, and many of the "smart" behaviors are heuristics I'm still iterating on.
 
-## Why Slave?
+Stack: Angular 21 (signals, standalone components) + FastAPI + MongoDB, with Ollama (or any OpenAI-compatible server) for inference.
 
-Slave implements a controlled, source-aware Retrieval-Augmented Generation (RAG) pipeline to ground AI responses in verifiable data and prevent hallucinations.
-Instead of relying solely on the language model’s internal knowledge, the system retrieves relevant information from multiple sources and injects it into the prompt with explicit confidence weighting.
+## What this project explores
 
-**100% Transparent Decision-Making** — See exactly why the AI answered what it did  
-**Privacy-First Architecture** — Everything runs locally, no telemetry, no cloud dependencies  
-**Anti-Hallucination System** — Multi-layer validation prevents fabricated responses  
-**Real-Time Streaming** — Token-by-token streaming with stop-generation control  
-**Intelligent Context Management** — Multi-source context fusion with confidence tracking  
-**Production-Ready** — Clean architecture, comprehensive error handling, fully typed
+### RAG and context assembly
 
+The chat pipeline assembles context from multiple sources before calling the model: uploaded files (PDF/DOCX/TXT/MD/CSV/JSON/YAML/code, extracted with PyPDF2 and python-docx), semantic memory, web search, and conversation history. Each source carries a confidence weight (files 0.99, memory 0.85, web 0.65, history 0.0) so factual claims are grounded in retrievable sources rather than chat history. Web search fans out across SearXNG, DuckDuckGo, Serper, and Tavily with fallback and quota tracking.
 
-## Core Capabilities
+### Provider abstraction
 
-### **1. Multi-Source Intelligent Context - RAG**
+Instead of hardcoding Ollama, inference goes through an `LLMProvider` interface (`backend/app/providers/`). `LLM_PROVIDER=ollama` is the default; `LLM_PROVIDER=openai_compat` points at any OpenAI-compatible endpoint — vLLM, llama.cpp server, LM Studio, or the OpenAI API itself. This was an exercise in designing a clean seam between the app and the model runtime.
 
-The AI doesn't just answer—it **intelligently assembles context** from multiple sources:
+### Vector search
 
-#### **File Intelligence**
+Memory embeddings go through a `VectorStore` abstraction (`backend/app/vector/`): the default is a naive cosine-similarity scan over MongoDB documents (simple, zero extra infrastructure), and `VECTOR_STORE=qdrant` switches to Qdrant for a real ANN index. Startup handles reindexing/backfill so you can switch stores on an existing database.
 
-- **Supported Formats**: PDF, DOCX, TXT, MD, CSV, JSON, YAML, code files
-- **Smart Extraction**: PyPDF2, python-docx, fallback encoding (UTF-8 → Latin-1)
-- **Attachment Persistence**: Files stored in MongoDB with 30-day expiry
-- **Context Injection**: File content automatically prioritized as authoritative source
+### Streaming
 
-#### **Multi-Provider Web Search**
+Server-Sent Events end-to-end: FastAPI async generators emit `token`, `reasoning_token`, `metadata`, `done`, and `error` events, and the Angular side parses the stream with a hand-rolled fetch-based SSE parser (needed for POST bodies and stop-generation control). Reasoning tokens render separately from the answer.
 
-- **Providers**: SearXNG (privacy), DuckDuckGo (free), Serper (Google proxy), Tavily (research)
-- **Smart Routing & Fallback Chain**: Auto-detects research queries with graceful degradation
-- **Advance Search Mode**: Distributes queries across all enabled providers, deduplicates results
-- **Quota Tracking**: Real-time monitoring of API limits with automatic provider switching
-- **Result Ranking**: Sentence-based scoring prioritizes most relevant snippets
+### Hallucination-mitigation heuristics (experimental)
 
-#### **URL Content Extraction**
+An attempt to reduce fabricated answers from small local models. These are heuristics I'm exploring, not guarantees:
 
-- **Smart Truncation**: Extracts key points for web search enrichment
-- **Source Attribution**: Full URL tracking in metadata
+- **Entity validation** — extract entities from the answer (spaCy if installed, regex fallback) and fuzzy-match them against source documents (substring, stem, acronym expansion). Many unverified entities cap the reported confidence.
+- **Source separation** — history and follow-up context are marked non-factual (confidence 0.0), so the model is prompted to draw facts only from files/memory/web.
+- **Reasoning veto** — if the model's internal reasoning contains phrases like "cannot confirm" or "no reliable source", the answer is refused or its confidence capped.
 
-#### **Semantic Memory System**
+The confidence numbers this produces are indicative, not rigorous — see limitations below.
 
-- **Embedding-Based Search**: Cosine embedding similarity matching with configurable threshold (0.3 default)
-- **Categorized Storage**: `preference/fact`, `important`, `other`
-- **Auto-Memory**: Automatically saves important exchanges for future context
-- **Confidence Scoring**: Each memory tracks confidence level (0.95 default)
+### Local voice pipeline
 
-#### **Conversation History**
+Speech-to-text via faster-whisper and text-to-speech via Piper, both running locally through `/voice` endpoints. Models are lazily downloaded on first use (~150MB Whisper base, ~60MB Piper voice) and cached in a Docker volume.
 
-- **Configurable Depth**: Default 10 messages, customizable per-session
-- **Follow-Up Mode**: Resolves pronouns/references against previous assistant answer
-- **Smart Truncation**: Per-message character limits prevent context overflow
+### Hugging Face model management
 
-### **2. Anti-Hallucination Validation Pipeline (fabricate facts)**
+Search the HF hub for GGUF models and list per-repo quant files (`GET /models/search`, `GET /models/search/{repo}/files`), then pull them into Ollama with SSE progress streaming via `hf.co/{repo}:{quant}` names (`POST /models/pull`). Installed models can be listed and deleted.
 
-**Solution**: Multi-layer validation and model limitation
+### Desktop shell
 
-#### **Source Layer Separation**
+A Tauri v2 shell (`frontend/src-tauri/`) wraps the Angular SPA into a native desktop app that talks to the local backend.
 
-Slave separates **factual sources** and **contextual sources**:
+### Topic management
 
-**Factual (High Confidence)**
+Conversations can be split into topics: a topic break closes the current thread and the LLM generates an overview summary of it, keeping long sessions navigable.
 
-- Files (0.99) — User-uploaded, authoritative
-- Memory (0.85) — Verified past knowledge
-- Web (0.65) — External grounding
+### Other things built along the way
 
-**Contextual (Supporting Only)**
-
-- History (0.0) — Continuity, not facts
-- Follow-Up (0.0) — Reference resolution
-
-**Why this matters**: The AI **cannot cite conversation history as a fact source**. It must draw facts from verifiable sources.
-
-#### **Entity Validation Service**
-
-**Dual-Mode Extraction**:
-
-1. **NLP Mode** (spaCy): Extracts PERSON, ORG, GPE, DATE, MONEY, etc.
-2. **Pattern Mode** (Fallback): Regex-based with intelligent common-word filtering
-
-**Strategy Fuzzy Matching**:
-
-- **Exact Match**: Direct substring matching
-- **Partial Match**: Lower-case fuzzy matching
-- **Stem Match**: Handles plurals/tenses ("company" ↔ "companies")
-- **Acronym Expansion**: "FBI" ↔ "Federal Bureau Investigation"
-
-**Factual Guard** - Risk Levels:
-
-- HIGH: 6+ Unverified entities → Cap confidence to 0.4
-- MED: 3-5 Unverified entities → Cap confidence to 0.5
-- LOW: <3 Unverified entities → Cap confidence to 0.6
-- NONE: All entities verified → No cap
-
-#### **Source Conflict Detection**: 
-
-- Identifies contradictions between information sources
-
-#### **Reasoning Veto System**  (Shows why answers were refused or confidence capped)
-
-**Hard Vetoes** 
-
-- "cannot confirm", "no reliable source", "conflicting sources"
-- "no access to", "not covered in context", "outside my knowledge"
-
-**Soft Vetoes** 
-
-- "uncertain", "speculative", "probably", "assuming", "might"
-- "not sure", "unclear", "low confidence"
-
-#### **Confidence Calculation**
-
-```
-Initial Confidence (from source type) : 85%
-    ↓
-Hard Veto? → REFUSE ANSWER
-Soft Veto? → Cap at 0.6
-    ↓
-Factual Guard (unverified entities)? → Cap by risk level
-    ↓
-Final Confidence
-```
-
-All stages tracked in metadata for full transparency.
-
-### **3. Streaming Architecture**
-
-**Real-Time Event Streaming** via Server-Sent Events (SSE):
-
-```typescript
-Event Types:
-├─ token             // Final answer generation
-├─ reasoning_token   // AI's thinking process generation
-├─ metadata          // Confidence, sources, validation results
-├─ done              // Stream complete
-└─ error             // Error with recovery suggestions
-```
-
-**Benefits**:
-
-- Token-by-token rendering for perceived speed
-- Stop-generation control (user can interrupt)
-- Transparent reasoning display (see AI's thought process)
-
-
-### **4. Centralized Configuration System**
-
-**Single Source of Truth**: All limits defined in [`settings.py`](backend/app/config/settings.py)
-
-```python
-# Example: Web search limits
-WEB_SEARCH_RESULTS_PER_PROVIDER: int = 10
-CHAT_WEB_SNIPPET_MAX_CHARS: int = 800
-CHAT_WEB_TOTAL_MAX_CHARS: int = 6000
-
-# Confidence levels
-CONFIDENCE_FILE: float = 0.99
-CONFIDENCE_MEMORY: float = 0.85
-CONFIDENCE_WEB: float = 0.65
-```
-
-**No magic numbers in code** — everything configurable via environment variables.
-
-
-### **5. Custom Rules Engine**
-
-Per-session:
-
-```json
-{
-   "searxng": true,
-   "duckduckgo": true,
-   "tavily": false,
-   "serper": false,
-   "advanceSearch": false,
-   "followUpEnabled": true,
-   "reasoningEnabled": false,
-   "customInstructions": "You are a Python expert...",
-   "webSearchLimit": 10,
-   "memorySearchLimit": 10,
-   "historyLimit": 10
-}
-```
-
-**Use Cases**:
-
-- Define AI behavior and personality via system prompts
-- Pre-configured rule templates for common use cases
-- Multiple rules per session with priority management
-- Dynamic rule injection into AI context
-- Disable web search for sensitive conversations
-- Enable reasoning mode for complex problem-solving
-- Custom system instructions per session (personality, expertise)
-
-### **6. Hugging Face Model Integration**
-
-- Search the Hugging Face hub for GGUF models and list per-repo quant files (`GET /models/search`, `GET /models/search/{repo}/files`)
-- Pull models into Ollama with SSE progress streaming via `hf.co/{repo}:{quant}` names (`POST /models/pull`), plus list/delete installed models
-
-### **7. Modern UI/UX**
-
-- Clean, responsive design with CSS design system
-- Skeleton loaders and smooth animations
-- Collapsible reasoning/validation panels
-- Color-coded confidence and risk indicators
-- Real-time typing indicators
-- Displays comprehensive metadata for each AI response
-
+- Centralized configuration: all limits and confidence weights live in `backend/app/config/settings.py`, overridable via environment variables — no magic numbers scattered in code.
+- Per-session rules: JSON rules control search providers, follow-up mode, reasoning mode, custom system instructions, and retrieval limits.
+- Frontend state entirely on Angular signals (no RxJS state), CSS-variable design system, collapsible reasoning/validation panels, per-response metadata display.
 
 ## Technical Stack
 
-### **Backend**
+**Backend**
 
-- **FastAPI** 0.128.0 — Async-first, type-safe REST API
-- **MongoDB** 4.16+ — Document database with Motor async driver
-- **Ollama** — Local LLM inference
-- **spaCy** 3.7+ — NLP for entity extraction (optional, graceful fallback)
-- **Pydantic** v2 — Strict data validation
-- **PyPDF2** — PDF text extraction
-- **Streaming**: Server-Sent Events (SSE)
-- **python-docx** — DOCX text extraction
+- FastAPI 0.128 — async REST API, SSE streaming
+- MongoDB 4.6+ with Motor (async driver)
+- Ollama (or any OpenAI-compatible server) for inference
+- spaCy 3.7+ for entity extraction (optional, regex fallback)
+- Pydantic v2, PyPDF2, python-docx
+- faster-whisper (STT), Piper (TTS)
+- Qdrant (optional vector store)
 
-### **Frontend**
+**Frontend**
 
-- **Angular** 21.1.0 — Standalone components
-- **Vite** — Fast build tool
-- **Signal-based State** — Signal-based reactive state management (no RxJS)
-- **EventSource** — SSE for real-time streaming
-- **Marked.js** — Markdown rendering
-- **Styling**: CSS Variables design system
-- **Build**: Angular CLI with SSR support
+- Angular 21 — standalone components, signal-based state (no RxJS)
+- Fetch-based SSE client for streaming
+- Marked.js for markdown rendering
+- Angular CLI build with SSR support; Tauri v2 for desktop
 
-### **Infrastructure**
+**Infrastructure**
 
-- **Node.js** 20+ / **Python** 3.10+
-- **MongoDB** 4.6+ (local/Docker/cloud)
-- **Docker** (for MongoDB + SearXNG)
+- Node.js 20+ / Python 3.10+
+- Docker Compose profiles for dev/prod, CPU/GPU Ollama, and SearXNG
 
 ## Quick Start
 
-### **Docker One-Command Startup**
-**Zero host dependencies.** Everything runs in containers — no heavy installation required on your machine.
+### Docker (recommended)
 
-#### **What You Need on Your Computer**
-1. **Docker Desktop** (Windows/Mac) or **Docker Engine + Docker Compose** (Linux)
-   - Windows: [Download Docker Desktop](https://docs.docker.com/desktop/install/windows-install/)
-   - Mac: [Download Docker Desktop](https://docs.docker.com/desktop/install/mac-install/)
-   - Linux: [Install Docker Engine](https://docs.docker.com/engine/install/) + [Docker Compose](https://docs.docker.com/compose/install/)
+Everything runs in containers — Docker is the only host dependency.
 
-2. **(Optional) NVIDIA GPU Support**
-   - Windows/Linux with NVIDIA GPU: [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+**Requirements**
 
-#### **Step-by-Step First-Time Setup**
+1. Docker Desktop (Windows/Mac) or Docker Engine + Compose (Linux)
+   - Windows: [Docker Desktop](https://docs.docker.com/desktop/install/windows-install/)
+   - Mac: [Docker Desktop](https://docs.docker.com/desktop/install/mac-install/)
+   - Linux: [Docker Engine](https://docs.docker.com/engine/install/) + [Compose](https://docs.docker.com/compose/install/)
+2. (Optional) NVIDIA GPU: [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 
-**Step 1: Choose Your Profile**
-
-Pick the frontend + backend + Ollama combination that fits your use case:
+**Step 1: Choose a profile**
 
 ```
-Profile                    Frontend                 Backend             Ollama  Use Case       
--------------------------  -----------------------  ------------------  ------  -------------- 
-`dev` + `ollama-cpu`       `ng serve` (hot reload)  `uvicorn --reload`  CPU     Development    
-`prod-spa` + `ollama-cpu`  Static (Nginx)           Production          CPU     Production SPA 
-`prod-ssr` + `ollama-cpu`  SSR (Node)               Production          CPU     Production SSR 
-`dev` + `ollama-gpu`       `ng serve`               `uvicorn --reload`  GPU     Dev with GPU   
-`prod-spa` + `ollama-gpu`  Static (Nginx)           Production          GPU     Prod SPA + GPU 
+Profile                    Frontend                 Backend             Ollama  Use case
+-------------------------  -----------------------  ------------------  ------  --------------
+`dev` + `ollama-cpu`       `ng serve` (hot reload)  `uvicorn --reload`  CPU     Development
+`prod-spa` + `ollama-cpu`  Static (Nginx)           Production          CPU     Static SPA
+`prod-ssr` + `ollama-cpu`  SSR (Node)               Production          CPU     SSR
+`dev` + `ollama-gpu`       `ng serve`               `uvicorn --reload`  GPU     Dev with GPU
+`prod-spa` + `ollama-gpu`  Static (Nginx)           Production          GPU     SPA with GPU
 ```
 
-**Step 2: Start All Services**
+**Step 2: Start all services**
 
-Open a terminal in the project root directory and run:
-
-**Production SPA (Recommended for First-Time Users)**
+From the project root:
 
 ```bash
-# find where the project is located
-cd ~/Slave
-```
-
-```bash
+# Static SPA (good default)
 docker compose --profile prod-spa --profile ollama-cpu up --build
-```
 
-**Development Mode (Hot Reload)**
-
-```bash
+# Development mode (hot reload)
 docker compose --profile dev --profile ollama-cpu up --build
-```
 
-**Production SSR**
-
-```bash
+# SSR
 docker compose --profile prod-ssr --profile ollama-cpu up --build
 ```
 
-**With NVIDIA GPU** (requires NVIDIA Container Toolkit)
+With NVIDIA GPU (requires NVIDIA Container Toolkit):
 
 ```bash
 # Dev with GPU
 OLLAMA_URL=http://ollama-gpu:11434 docker compose --profile dev --profile ollama-gpu up --build
 
-# Prod SPA with GPU
+# SPA with GPU
 OLLAMA_URL=http://ollama-gpu:11434 docker compose --profile prod-spa --profile ollama-gpu up --build
 ```
 
-**Windows PowerShell** (GPU example)
+Windows PowerShell (GPU example):
 
 ```powershell
 $env:OLLAMA_URL="http://ollama-gpu:11434"; docker compose --profile prod-spa --profile ollama-gpu up --build
 ```
 
----
+**Step 3: Wait for build and startup**
 
-**Step 3: Wait for Build & Startup**
+First startup takes 5-15 minutes depending on connection speed: it downloads base images (Python, Node, MongoDB, Nginx, Ollama), installs Python and Node dependencies, downloads the spaCy model (`en_core_web_sm`), and builds the frontend (prod profiles only).
 
-First-time startup will take **5-15 minutes** depending on your internet speed:
-
-- Downloads base images (Python, Node, MongoDB, Nginx, Ollama)
-- Installs Python dependencies (FastAPI, spaCy, PyPDF2, etc.)
-- Downloads spaCy NLP model (`en_core_web_sm`)
-- Installs Node dependencies (Angular, etc.)
-- Builds frontend (dev: skipped, prod: full build)
-
-Watch for these success indicators in logs:
+Success indicators in the logs:
 
 ```
 mongo       - Waiting for connections on port 27017
@@ -336,15 +151,15 @@ ollama      - Listening...
 frontend    - Compiled successfully
 ```
 
+**Step 4: Pull an Ollama model**
 
-**Step 4: Pull an Ollama Model**
-The Ollama container is running but **has no models yet**. Pull one:
+The Ollama container starts with no models. Pull one:
 
 ```bash
 # Enter the Ollama container
 docker exec -it slave-ollama-1 bash
 
-# Inside container: Pull a model (choose one)
+# Inside container: pull a model (choose one)
 ollama pull qwen2.5:3b
 ollama pull gemma3:1b
 ollama pull <model>
@@ -353,22 +168,17 @@ ollama pull <model>
 exit
 ```
 
-**Alternative: Pull from host** (if Ollama container name is different)
+Or from the host (find the container name first if it differs):
 
 ```bash
-# Find container name:
 docker ps | grep ollama
 
-#Pull a model
 docker exec -it slave-ollama-1 ollama pull qwen2.5:3b
 docker exec -it slave-ollama-1 ollama pull gemma3:1b
 docker exec -it slave-ollama-1 ollama pull <model>
-
 ```
 
-**Alternative: Pull via the API (Hugging Face GGUF or Ollama names)**
-
-No `docker exec` needed — `POST /models/pull` streams progress via SSE and accepts either a plain Ollama name or a Hugging Face GGUF reference:
+Or via the API (no `docker exec` needed — `POST /models/pull` streams progress via SSE and accepts a plain Ollama name or a Hugging Face GGUF reference):
 
 ```bash
 curl -N -X POST http://localhost:8000/models/pull \
@@ -381,97 +191,104 @@ curl -N -X POST http://localhost:8000/models/pull \
   -d '{"name": "hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"}'
 ```
 
-**Step 5: Access the Application**
-
-Open your browser:
+**Step 5: Access the application**
 
 ```
-Service             URL                          Description           
-------------------  ---------------------------  --------------------- 
-**Frontend (SPA)**  http://localhost:4173        Main UI (prod SPA)    
-**Frontend (SSR)**  http://localhost:4000        Main UI (prod SSR)    
-**Frontend (Dev)**  http://localhost:4200        Main UI (dev mode)    
-**Backend API**     http://localhost:8000/docs   FastAPI Swagger UI    
-**SearXNG**         http://localhost:8080        Private search engine 
-**MongoDB**         `mongodb://localhost:27017`  Database (direct)     
-**Ollama**          http://localhost:11434       LLM API               
+Service         URL                          Description
+--------------  ---------------------------  ---------------------
+Frontend (SPA)  http://localhost:4173        Main UI (prod SPA)
+Frontend (SSR)  http://localhost:4000        Main UI (prod SSR)
+Frontend (Dev)  http://localhost:4200        Main UI (dev mode)
+Backend API     http://localhost:8000/docs   FastAPI Swagger UI
+SearXNG         http://localhost:8080        Private search engine
+MongoDB         mongodb://localhost:27017    Database (direct)
+Ollama          http://localhost:11434       LLM API
 ```
 
-**Step 6: Verify Everything Works**
-
-1. **Check API Health**
+**Step 6: Verify everything works**
 
 ```bash
+# API health
 curl http://localhost:8000/health
-```
+# Expected: { "status": "healthy", "database": "connected", "version": "1.0.0" }
 
-Expected response:
-
-```json
-{ "status": "healthy", "database": "connected", "version": "1.0.0" }
-```
-
-2. **Check Ollama Models**
-
-```bash
+# Installed Ollama models
 curl http://localhost:11434/api/tags
 ```
 
-3. **Open the Frontend**  
+Then open the frontend (4173/4000/4200 depending on profile), create a chat session, and send a message.
 
-Navigate to http://localhost:4173 (or 4000/4200 depending on profile).  
-Create a chat session and test a message.
+### Common commands
 
-#### **Common Commands**
-
-**Stop all services**
 ```bash
+# Stop all services
 docker compose --profile prod-spa --profile ollama-cpu down
-```
 
-**Restart services** (without rebuild)
-```bash
+# Restart (without rebuild)
 docker compose --profile prod-spa --profile ollama-cpu up
-```
 
-**Rebuild after code changes**
-```bash
+# Rebuild after code changes
 docker compose --profile prod-spa --profile ollama-cpu up --build
-```
 
-**View logs**
-```bash
+# View logs
 docker compose logs -f backend
 docker compose logs -f frontend-spa
 docker compose logs -f ollama
-```
 
-**Clean up (remove volumes, fresh start)**
-```bash
+# Clean up (remove volumes, fresh start)
 docker compose down -v
 ```
 
-#### **Data Persistence**
+### Data persistence
 
-All data persists in Docker named volumes:
+All data lives in Docker named volumes and survives `docker compose down`:
 
-- `mongo_data`: MongoDB database (conversations, memories, rules)
-- `ollama_data`: Ollama models (multi-GB, survives restarts)
-- `qdrant_data`: Qdrant vector store (memory embeddings when `VECTOR_STORE=qdrant`)
-- `voice_models`: Whisper STT + Piper TTS model files
+- `mongo_data` — MongoDB (conversations, memories, rules)
+- `ollama_data` — Ollama models (multi-GB)
+- `qdrant_data` — Qdrant vector store (when `VECTOR_STORE=qdrant`)
+- `voice_models` — Whisper STT + Piper TTS model files
 
-Even after `docker compose down`, your data remains. To delete:
+To delete everything:
 
 ```bash
 docker volume rm slave_mongo_data slave_ollama_data slave_qdrant_data slave_voice_models
 ```
 
-#### **Troubleshooting**
+### First-run downloads
+
+After these one-time downloads, inference runs fully offline (web search still goes out to the internet when triggered):
+
+- Embedding model (~90MB)
+- Whisper `base` STT model (~150MB, on first voice use)
+- Piper TTS voice (~60MB)
+- Ollama models (GB-scale)
+
+### API keys (optional)
+
+Only needed for the paid web search providers (Serper, Tavily). Skip this if you only use the free providers (DuckDuckGo, SearXNG).
+
+Register at [serper.dev](https://serper.dev/) and/or [tavily.com](https://www.tavily.com/), then:
+
+```bash
+# Copy the example file
+cp .env.example .env
+
+# Edit .env and add your API keys
+SERPER_API_KEY=your_serper_api_key_here
+TAVILY_API_KEY=your_tavily_api_key_here
+```
+
+Then restart:
+
+```bash
+docker compose --profile prod-spa --profile ollama-cpu up --build
+```
+
+### Troubleshooting
 
 **Port already in use**
 
 ```bash
-# Check what's using port 4173 (or 8000, 11434, etc.)
 # Windows
 netstat -ano | findstr :4173
 
@@ -486,218 +303,124 @@ lsof -i :4173
 ```bash
 # Verify NVIDIA Docker runtime
 docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi
-
-# If this fails, NVIDIA Container Toolkit isn't installed correctly
+# If this fails, the NVIDIA Container Toolkit isn't installed correctly
 ```
 
 **Backend can't connect to MongoDB**
+
 - Wait 10-20 seconds after `docker compose up` for MongoDB to initialize
 - Check logs: `docker compose logs mongo`
 
-**First build is slow**
-- Normal. Subsequent builds use Docker layer cache (much faster)
-- Use `--build` only when you change code
-
----
-
-#### **API Keys**
-
-To enable paid web search providers (Serper, Tavily)
-
-**Skip this step** if you only ant to use free providers (DuckDuckgo, SearXNG), create a `.env`
-
-- Register your account to get our API key
-**SerperDev** - (https://serper.dev/)
-**Tavily** - (https://www.tavily.com/)
+**MongoDB connection failed (manual setup)**
 
 ```bash
-# Copy the example file
-cp .env.example .env
+mongosh --eval "db.adminCommand('ping')"
+# Default connection string: mongodb://127.0.0.1:27017
 
-# Edit .env and add your API keys
-SERPER_API_KEY=your_serper_api_key_here
-TAVILY_API_KEY=your_tavily_api_key_here
+Start-Service MongoDB          # Windows
+sudo systemctl start mongod    # Linux
+docker start mongo             # Docker
 ```
 
-**Then restart**:
+**Ollama not responding**
 
 ```bash
-docker compose --profile prod-spa --profile ollama-cpu up --build
+curl http://localhost:11434/api/tags
+ollama serve
+ollama pull <model>
 ```
 
-### **Alternative: Manual Setup (Without Docker)**
-If you prefer to run services directly on your host machine (not recommended for beginners):
+**Web search returns nothing**
 
-### **1. Prerequisites**
+- Check SearXNG is running if using local search
+- Review quotas in `serper_quota` / `tavily_quota`
+- Check backend logs for API errors
+- Check provider toggles in the Rules UI and API keys in `.env`
+
+**Entity extraction errors**
 
 ```bash
-# Check versions
+pip install spacy
+python -m spacy download en_core_web_sm
+```
+
+**First build is slow** — normal; subsequent builds use the Docker layer cache. Use `--build` only after code changes.
+
+### Manual setup (without Docker)
+
+**1. Prerequisites**
+
+```bash
 node --version    # v20.19+ or v22.12+
 python --version  # 3.10+
 mongod --version  # 4.6+
 
 # Install Ollama (https://ollama.ai)
-ollama pull llama2:7b
 ollama pull <model>
 ```
 
-### **2. Backend Setup**
+**2. Backend**
 
 ```bash
 cd backend
 
-# Clean up (optional but recommended)
-rm -rf venv
-find . -type d -name "__pycache__" -exec rm -rf {} +
-find . -type f -name "*.pyc" -delete
-
-# Create virtual environment
 python -m venv venv
 source venv/bin/activate  # Windows: venv/Scripts/activate
 
-# Install dependencies
 pip install -r requirements.txt
 
-# Install spaCy for NLP entity extraction (Python 3.10-3.13 only)
+# Optional: spaCy for NLP entity extraction (Python 3.10-3.13)
 pip install spacy
 python -m spacy download en_core_web_sm
 
-# Create .env
-cp .env.example .env
-Edit .env with your settings
+cp .env.example .env   # edit with your settings
 
-# Start server
 uvicorn app.main:app --reload
 ```
 
-**API**: http://127.0.0.1:8000  
-**API Docs**: http://127.0.0.1:8000/docs
+API: http://127.0.0.1:8000 — docs at http://127.0.0.1:8000/docs
 
-### **3. Frontend Setup**
+**3. Frontend**
 
 ```bash
 cd frontend
-
-# Clean up (optional but recommended)
-rm -rf node_modules .angular package-lock.json
-npm cache clean --force
-
-# Install dependencies
 npm install
-
-# Start development server
-npx ng serve # --verbose /to see logs
+npx ng serve
 ```
 
-**Frontend URL**: http://localhost:4200
+Frontend: http://localhost:4200
 
-### **4. Database Setup**
-
-**Option A: MongoDB Service (Windows)**
+**4. Database**
 
 ```powershell
-Start-Service MongoDB
+Start-Service MongoDB                 # Windows service
 ```
-
-**Option B: Docker**
 
 ```bash
-docker run -d --name mongo -p 27017:27017 -v C:\data\db:/data/db mongo:7
+docker run -d --name mongo -p 27017:27017 -v /data/db:/data/db mongo:7   # Docker
+mongod --dbpath /data/db                                                 # manual
 ```
 
-**Option C: Manual Start**
-
-```bash
-mongod --dbpath /data/db
-```
-
-### **5. Local Web Search (SearXNG)**
+**5. Local web search (SearXNG)**
 
 ```bash
 cd searxng
-
-# Edit settings.yml - set a strong secret_key
+# Edit settings.yml — set a strong secret_key
 docker compose up -d
 ```
 
-**SearXNG URL**: http://localhost:8080
+SearXNG: http://localhost:8080
 
 ## Configuration
 
-### **Backend Environment (.env)**
-
-Copy .env.example to .env and fill in your config
-
-### **AI Models Configuration**
-
-Edit `backend/app/config/ai_models.py`:
-```python
-AVAILABLE_MODELS = [
-    {
-        "id": "llama2:13b",
-        "name": "Llama 2 13B",
-        "description": "Powerful reasoning",
-        'size': '13B'
-    },
-    # Add custom models
-]
-```
-
-## Development
-
-### **Backend Development**
-
-- Backend: Ruff for linting/formatting
-
-**Code Quality**
-
-```bash
-cd backend
-
-# Lint and format with Ruff
-ruff check --fix .
-ruff format .
-```
-
-**Testing**
-
-```bash
-pytest
-pytest --cov=app
-pytest -v tests/....
-pytest -v
-```
-
-### **Frontend Development**
-
-- Frontend: Prettier + ESLint
-
-**Code Quality**
-
-```bash
-cd frontend
-
-# Format with Prettier
-npm run format:check
-npm run format:fix
-
-# Linting (ESLint)
-npm run lint
-npm run lint:fix
-```
-
-**Testing**
-
-```bash
-npm test
-npm run test:coverage
-```
+- Backend: copy `.env.example` to `.env` and fill in your config. All limits and confidence weights live in `backend/app/config/settings.py` and can be overridden via environment variables.
+- Models shown in the UI: edit `backend/app/config/ai_models.py` to add any Ollama-compatible model.
 
 ## Desktop (Tauri)
 
-The Angular frontend can also run as a native desktop app via [Tauri v2](https://v2.tauri.app/).
+The Angular frontend also runs as a native desktop app via [Tauri v2](https://v2.tauri.app/).
 
-**Prerequisites:** [Rust](https://rustup.rs/) (stable) and Node 20+.
+Prerequisites: [Rust](https://rustup.rs/) (stable) and Node 20+.
 
 ```bash
 cd frontend
@@ -705,218 +428,67 @@ cd frontend
 # Dev: opens a desktop window loading the ng serve dev server (localhost:4200)
 npm run tauri:dev
 
-# Build: bundles the static SPA build into a native app (frontend/src-tauri/target/release/bundle/)
+# Build: bundles the static SPA into a native app (frontend/src-tauri/target/release/bundle/)
 npm run tauri:build
 ```
 
-The desktop app talks to the backend at `http://127.0.0.1:8000`, so the backend must be running via Docker Compose (e.g. `docker compose --profile dev up`).
+The desktop app talks to the backend at `http://127.0.0.1:8000`, so the backend must be running (e.g. `docker compose --profile dev up`).
 
-## Troubleshooting
+## Development
 
-### **MongoDB Connection Failed**
-
-```bash
-# Check MongoDB running
-mongosh --eval "db.adminCommand('ping')"
-
-# Verify connection string in settings
-# Default: mongodb://127.0.0.1:27017
-
-# Start MongoDB service
-Start-Service MongoDB  # Windows
-sudo systemctl start mongod  # Linux
-
-# Or use Docker
-docker start mongo
-
-# Create database (auto-created on first run)
-mongosh slave
-```
-
-### **Ollama Not Responding**
+**Backend** (Ruff for linting/formatting):
 
 ```bash
-# Check Ollama running
-curl http://localhost:11434/api/tags
-
-# Start Ollama
-ollama serve
-
-# Pull missing models
-ollama pull <model>
+cd backend
+ruff check --fix .
+ruff format .
 ```
 
-### **Web search no results**
-
-- Check SearXNG is running if using local search
-- Review quotas in: serper_quota, tavily_quota
-- Check backend logs for API errors
-- Check provider settings in Rules UI. Verify API keys in `.env` are set correctly.
-
-### **Entity extraction errors**
+**Frontend** (Prettier + ESLint):
 
 ```bash
-# Install spaCy: 
-pip install spacy 
-python -m spacy download en_core_web_sm
+cd frontend
+npm run format:check
+npm run format:fix
+npm run lint
+npm run lint:fix
 ```
 
-## Privacy & Security
+## Design decisions
 
-### **Privacy Guarantees**
+- **Mongo as source of truth, Qdrant optional.** MongoDB already stores everything else, so the default vector search is a plain cosine scan over Mongo docs — zero extra infrastructure, fine at small scale. Qdrant is a config switch (`VECTOR_STORE=qdrant`) for when a real ANN index matters; startup reindex/backfill makes switching painless.
+- **Provider abstraction instead of hardcoding Ollama.** Partly to learn interface design, partly practical: `openai_compat` means the same app runs against vLLM, llama.cpp, LM Studio, or OpenAI without code changes.
+- **API-key auth is optional and off by default.** This is a local-first, single-user app; adding accounts and auth flows would be complexity without benefit for the intended use. An optional API key exists for exposing the backend beyond localhost.
+- **Messages embedded in session documents.** Simplicity first: one read gets a whole conversation. The tradeoff is MongoDB's 16MB document limit, which caps very long sessions — a known constraint I'd revisit with a separate messages collection.
+- **No test suite yet.** I prioritized prototype speed while the architecture was churning. This is the project's biggest gap and the first thing on the list to fix.
 
-**100% Local Processing**: All AI inference runs on your machine  
-**No Telemetry**: Zero tracking, analytics, or data collection  
-**Local Data Storage**: All conversations stay in your MongoDB  
-**Local-First**: After the first-run downloads below, inference runs fully offline. Web search (including DuckDuckGo and SearXNG queries) still goes out to the internet when triggered  
-**First run downloads**: embedding model (~90MB), Whisper `base` STT model (~150MB, on first voice use), Piper TTS voice (~60MB), and Ollama models (GB-scale)  
-**Optional Web** — Serper/Tavily only when you enable/trigger search  
-**Open Source**: Full code transparency, audit at any time
-**No Third-Party CDNs** — All assets bundled
+## Known limitations
 
-### **External Services**
+- No automated tests.
+- Single-user design: optional API key, no user accounts or multi-tenancy.
+- The confidence numbers are heuristic and indicative, not rigorous — the hallucination-mitigation pipeline reduces obvious fabrication but guarantees nothing.
+- Messages embedded in session docs limit very long conversations (16MB document cap).
+- First run downloads models from Hugging Face, so setup is not fully offline.
+- Small local models (1B-7B) produce noticeably weaker answers than hosted frontier models; the retrieval pipeline helps but doesn't close the gap.
 
-**Web Search Providers** (Serper, Tavily):
-- Only used when explicitly requested
-- Can be disabled in settings
-- Local alternative: SearXNG (fully private)
+## Privacy notes
 
-### **Security Best Practices**
+All inference, storage, and voice processing run locally; there is no telemetry. Web search (including DuckDuckGo/SearXNG queries) goes out to the internet when triggered, and Serper/Tavily are only used if you configure and enable them. If you expose the backend beyond localhost, put it behind HTTPS (reverse proxy), restrict `CORS_ORIGINS`, enable MongoDB auth, and set a strong SearXNG `secret_key`.
 
-1. **MongoDB**
+## System requirements
 
-```bash
-# Enable MongoDB authentication
-mongod --auth --bind_ip 127.0.0.1
-# Set strong MongoDB passwords
-```
+Minimum: 8GB RAM, 4-core CPU, ~40GB disk (Docker images + one 7B model + databases). Recommended: 16GB+ RAM, SSD, and a GPU for faster inference. Rough model memory: 7B ≈ 6-8GB, 13B ≈ 10-12GB, 33B+ ≈ 20GB+.
 
-2. **Reverse Proxy** (Nginx/Caddy)
+## Ideas to explore next
 
-```nginx
-# Use HTTPS with reverse proxy (nginx/Caddy)
-location /api {
-    proxy_pass http://127.0.0.1:8000;
-}
-```
+1. GraphRAG — graph-enhanced retrieval, possibly with Tree-sitter AST parsing for code
+2. Image generation via an external ComfyUI instance (models from Civitai)
+3. Separate messages collection to remove the session-size cap
 
-3. **Firewall Rules**
+## Built with
 
-```bash
-ufw allow 4200/tcp  # Frontend
-ufw allow 8000/tcp  # Backend (localhost only recommended)
-```
+[Ollama](https://ollama.ai) · [FastAPI](https://fastapi.tiangolo.com) · [Angular](https://angular.dev) · [MongoDB](https://www.mongodb.com) · [spaCy](https://spacy.io) · [SearXNG](https://docs.searxng.org) · [Serper](https://serper.dev/) · [Tavily](https://www.tavily.com/) · [Tauri](https://v2.tauri.app/) · [Qdrant](https://qdrant.tech/)
 
-4. **CORS Restrictions**
+## Screenshot
 
-```env
-CORS_ORIGINS=["http://localhost:4200"]  # Whitelist only
-```
-
-5. **Set strong `secret_key` for SearXNG**
-
-```
-<random 32-64 chars>
-```
-
-6. **Update dependencies regularly**
-
-## Performance
-
-### **System Requirements**
-
-**Minimum**:
-
-- 8GB RAM
-- 4-core CPU
-- ~40GB disk space (Docker images + one 7B model + databases)
-- MongoDB 4.6+
-
-**Recommended**:
-
-- 16GB+ RAM (for larger models)
-- 8-core CPU
-- SSD for MongoDB
-- GPU for faster inference (optional)
-
-### **Model Memory Usage (minimum)**
-
-- 7B parameters: ~6-8GB RAM
-- 13B parameters: ~10-12GB RAM
-- 33B+ parameters: 20GB+ RAM
-
-### **Optimizations**
-
-- MongoDB connection pooling
-- Async I/O throughout
-- Efficient embedding caching
-- Lazy loading in frontend
-- SSE streaming reduces memory
-- Signal-based reactivity (minimal rerenders)
-- Configure Ollama GPU acceleration (CUDA/ROCm)
-- Limit concurrent sessions (1-3 for 7B models on 8GB RAM)
-
-## Documentation
-
-- **Swagger UI**: http://127.0.0.1:8000/docs
-- **ReDoc**: http://127.0.0.1:8000/redoc
-- **README**: files in major directories
-
-## Contributing
-
-Built with best-in-class open-source tools:
-
-- [**Ollama**](https://ollama.ai) — Local LLM inference engine
-- [**FastAPI**](https://fastapi.tiangolo.com) — Modern Python web framework
-- [**Angular**](https://angular.dev) — Enterprise web framework
-- [**MongoDB**](https://www.mongodb.com) — Document database
-- [**spaCy**](https://spacy.io) — Industrial-strength NLP
-- [**SearXNG**](https://docs.searxng.org) — Privacy-respecting metasearch
-- [**SerperDev**](https://serper.dev/) - Google-search results in real-time 
-- [**Tavily**](https://www.tavily.com/) - Tavily is the real‑time search engine for AI agents and RAG workflows
-
-## FAQ 
-
-**Q: Is my data truly private?**  
-A: Yes. All LLM inference runs locally via Ollama. Web search is optional and only triggers when you enable it. MongoDB is local. Zero telemetry.
-
-**Q: Do I need a GPU?**  
-A: No, but it helps. Ollama works on CPU, just slower.
-
-**Q: Can I use custom models?**  
-A: Yes! Any Ollama-compatible model. Add to `ai_models.py`.
-
-**Q: Why is reasoning separate from answer?**  
-A: Separating internal thoughts from user-facing response improves quality and enables validation.
-
-**Q: What's the veto system?**  
-A: AI checks its own reasoning. If it said "cannot confirm" internally but generated a confident answer externally, veto system catches this inconsistency.
-
-**Q: How does entity validation work?**  
-A: Extracts names/places from answer, checks if they appear in source documents. Flags unverified entities.
-
-**Q: Why fuzzy matching?**  
-A: Exact matching fails on plurals ("APIs" vs "API"), partial phrases ("John Smith" in "Dr. John Smith"), etc.
-
-**Q: How does follow-up mode work?**  
-A: When enabled, the AI treats the **previous assistant answer** as the **primary context**. Pronouns/references resolve against it first, then fall back to conversation history.
-
-**Q: Do I need spaCy?**  
-A: Recommended. System falls back to pattern-based extraction.
-
-## Roadmap
-
-### **Planned Features**
-1. ~~Plugin system for custom model providers~~ ✅ Implemented — LLM provider abstraction (`LLM_PROVIDER=ollama` or `LLM_PROVIDER=openai_compat` for vLLM / llama.cpp server / LM Studio / OpenAI)
-2. ~~Local Model Runtime Layer (ollama => lama.cpp or vLLM)~~ ✅ Supported via `LLM_PROVIDER=openai_compat`
-3. Hugging Face integration - AI model repository
-4. ~~Vector database abstraction layer (Qdrant)~~ ✅ Implemented — `VECTOR_STORE=mongo` (default) or `VECTOR_STORE=qdrant`
-5. Tauri Desktop (UI)
-6. ~~Voice input & output (speech → text → AI → speech)~~ ✅ Implemented — local STT (faster-whisper) + TTS (Piper) via `/voice` endpoints
-7. Advanced GraphRAG + Tree-sitter AST + Tooling (Graph-enhanced retrieval / GraphRAG - experimental)
-8. Image & Video Generation - Stable Diffusion integration (From: Civitai, Run: ComfyUI)
-
-## App screenshot
 ![App screenshot](/frontend/src/assets/images/app_screenshot.png)
-
-**Built with ❤️ for privacy-conscious developers**

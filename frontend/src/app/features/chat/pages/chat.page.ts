@@ -65,6 +65,8 @@ export class ChatPage implements OnInit, AfterViewInit, OnDestroy {
   noModelsInstalled = signal(false);
   isDropdownOpen = false;
   isErrorDismissed = signal(false);
+  /** Whether the topic-break divider is expanded to show the stored summary */
+  showTopicSummary = signal(false);
   selectedFileName = signal('');
   fileError = signal('');
   isFileUploading = signal(false);
@@ -105,6 +107,7 @@ export class ChatPage implements OnInit, AfterViewInit, OnDestroy {
       const id = params.get('id') ?? 'default';
       this.store.selectSession(id);
       this.isErrorDismissed.set(false);
+      this.showTopicSummary.set(false);
     });
 
     // Auto-resize textarea when draft message changes
@@ -283,6 +286,15 @@ export class ChatPage implements OnInit, AfterViewInit, OnDestroy {
     }
     this.releaseMicrophone();
     this.isRecording.set(false);
+  }
+
+  /**
+   * Toggle the expanded topic summary under the "New topic" divider.
+   * Only expands when the current session has a stored summary.
+   */
+  toggleTopicSummary(): void {
+    if (!this.store.currentSession()?.topic_summary) return;
+    this.showTopicSummary.update((v) => !v);
   }
 
   /**

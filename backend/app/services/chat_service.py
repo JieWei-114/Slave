@@ -196,19 +196,39 @@ async def _extract_url_content(user_content: str, session_id: str) -> tuple[str,
         return None, []
 
 
+def _filter_messages_after_topic_break(messages: list[dict], topic_break_at) -> list[dict]:
+    """
+    Keep only messages created after the latest topic break (if any).
+
+    Sessions with a `topic_break_at` marker treat earlier messages as a
+    previous topic: they are excluded from context building so the model
+    starts fresh (aside from the stored topic summary).
+
+    """
+    if not topic_break_at:
+        return messages
+    return [m for m in messages if m.get('created_at') and m['created_at'] > topic_break_at]
+
+
 def _get_primary_assistant_answer(session_id: str) -> str:
     """
     Retrieve most recent assistant response from conversation history.
 
     Used for follow-up detection and reference resolution.
+    Messages before a topic break are ignored.
 
     """
     try:
-        session = sessions_collection.find_one({'id': session_id}, {'_id': 0, 'messages': 1})
+        session = sessions_collection.find_one(
+            {'id': session_id}, {'_id': 0, 'messages': 1, 'topic_break_at': 1}
+        )
         if not session or not session.get('messages'):
             return None
 
-        for msg in reversed(session['messages']):
+        messages = _filter_messages_after_topic_break(
+            session['messages'], session.get('topic_break_at')
+        )
+        for msg in reversed(messages):
             if msg.get('role') == 'assistant' and msg.get('content', '').strip():
                 return msg['content']
         return None
@@ -260,7 +280,7 @@ async def build_prompt_with_memory(
     local_memory_limit = config.get('memorySearchLimit') or MEMORY_RESULTS_LIMIT
     local_file_limit = config.get('fileUploadMaxChars') or FILE_CONTENT_MAX
     custom_instructions = config.get('customInstructions', '')
-    follow_up_enabled = config.get('followUpEnabled', False)
+    follow_up_enabled = config.get('followUpEnabled', True)
 
     logger.info(
         'Config loaded: web=%s, hist=%s, mem=%s, file=%s, follow_up=%s',
@@ -371,6 +391,26 @@ async def build_prompt_with_memory(
             extra={'session_id': chat_sessionId},
         )
 
+    # 7.2b: Add topic overview (contextual source, like history)
+    topic_summary = ''
+    try:
+        session_doc = sessions_collection.find_one(
+            {'id': chat_sessionId}, {'_id': 0, 'topic_summary': 1}
+        )
+        topic_summary = ((session_doc or {}).get('topic_summary') or '').strip()
+    except Exception as e:
+        logger.warning(f'Failed to load topic summary: {e}', extra={'session_id': chat_sessionId})
+
+    if topic_summary:
+        blocks.append(
+            'CONVERSATION OVERVIEW (contextual, non-factual)\n'
+            f'Overview of earlier conversation (before topic change): {topic_summary}'
+        )
+        sources_considered['overview'] = 0.0
+        logger.info(
+            'Overview: %s chars', len(topic_summary), extra={'session_id': chat_sessionId}
+        )
+
     # 7.3: Build WEB context (factual source)
     web_result = await build_context_for_source(
         session_id=chat_sessionId,
@@ -469,6 +509,9 @@ async def build_prompt_with_memory(
         },
         'history': {
             'available': 'history' in sources_considered,
+        },
+        'overview': {
+            'available': bool(topic_summary),
         },
         'follow_up': {
             'available': is_follow_up,
@@ -795,7 +838,9 @@ async def _build_history_context(session_id: str, limits: dict) -> dict:
                 'warning': None,
             }
 
-        messages = session['messages']
+        messages = _filter_messages_after_topic_break(
+            session['messages'], session.get('topic_break_at')
+        )
         to_include = messages[-limits.get('history_messages', HISTORY_LIMIT) :]
 
         if not to_include:

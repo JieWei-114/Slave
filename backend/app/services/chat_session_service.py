@@ -83,6 +83,8 @@ def list_sessions() -> list[dict]:
             'id': 1,
             'title': 1,
             'updated_at': 1,
+            'topic_break_at': 1,
+            'topic_summary': 1,
         },
     )
 

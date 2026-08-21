@@ -104,32 +104,40 @@
   animation: pulse 1.5s infinite;
 }
 
-.header-toggle-btn {
-  padding: 8px 16px;
-  background: var(--primary-lite);
-  color: white;
-  border: none;
-  border-radius: var(--radius-md);
+/* Topic-break divider between messages */
+.topic-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 0;
+  user-select: none;
+}
+
+.topic-divider.expandable {
   cursor: pointer;
-  font-size: 14px;
-  font-weight: 500;
-  transition: all var(--transition-base);
+}
+
+.topic-divider-line {
+  flex: 1;
+  height: 1px;
+  background: var(--gray-300);
+}
+
+.topic-divider-text {
+  font-size: 12px;
+  color: var(--gray-500);
   white-space: nowrap;
 }
 
-.header-toggle-btn:hover {
-  background: var(--primary-dark);
-  transform: translateY(-2px);
-  box-shadow: var(--shadow-lg);
-}
-
-.header-toggle-btn.active {
-  background: var(--primary-dark);
-  box-shadow: var(--shadow-lg);
-}
-
-.header-toggle-btn:active {
-  transform: translateY(0);
+.topic-summary {
+  margin: 0 auto 12px;
+  max-width: 80%;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--gray-500);
+  background: var(--gray-100);
+  border: 1px solid var(--gray-300);
+  border-radius: var(--radius-md);
 }
 
 @keyframes pulse {
@@ -233,11 +241,10 @@
   border-radius: 0 0 12px 12px;
 }
 
-.chat-button-wrapper {
+/* New-topic button at the left of the input row */
+.btn-new-topic {
   display: flex;
-  gap: var(--spacing-sm);
-  margin-left: 50px;
-  padding-bottom: 10px;
+  align-items: center;
 }
 
 .chat-input {

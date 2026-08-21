@@ -44,7 +44,20 @@ export class PanelComponent implements AfterViewInit {
 
   ngAfterViewInit(): void {
     if (isPlatformBrowser(this.platformId)) {
+      this.restorePanelWidth();
       this.setupPanelResize();
+    }
+  }
+
+  /**
+   * Restore the last user-dragged width so the panel opens at a stable size
+   */
+  private restorePanelWidth(): void {
+    const saved = Number(localStorage.getItem('panel-width'));
+    if (saved >= 390 && saved <= 600) {
+      const panel = this.elementRef.nativeElement;
+      panel.style.width = saved + 'px';
+      panel.style.minWidth = saved + 'px';
     }
   }
 
@@ -95,6 +108,8 @@ export class PanelComponent implements AfterViewInit {
         this.isResizing = false;
         document.body.style.cursor = '';
         document.body.style.userSelect = '';
+        const width = this.elementRef.nativeElement?.offsetWidth;
+        if (width) localStorage.setItem('panel-width', String(width));
       }
     });
   }

@@ -89,7 +89,7 @@ class RulesConfig(BaseModel):
     fileUploadMaxChars: int | None = None
 
     customInstructions: str = ''
-    followUpEnabled: bool = False
+    followUpEnabled: bool = True
     reasoningEnabled: bool = False
 
 
