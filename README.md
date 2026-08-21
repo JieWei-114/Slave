@@ -2,7 +2,7 @@
 
 A local-first AI assistant — built as a learning project to explore full-stack AI application development.
 
-This is a self-hosted chat assistant that runs on Ollama, with retrieval-augmented generation (RAG), semantic memory, local voice input/output, and an optional desktop shell. I built it as a solo project to learn how the pieces of a modern AI application fit together: streaming inference, context assembly, vector search, provider abstractions, and a reactive frontend. It works, but it is experimental: single-user by design, no automated test suite yet, and many of the "smart" behaviors are heuristics I'm still iterating on.
+This is a self-hosted chat assistant that runs on Ollama, with retrieval-augmented generation (RAG), semantic memory, local voice input/output, and an optional desktop shell. I built it as a solo project to learn how the pieces of a modern AI application fit together: streaming inference, context assembly, vector search, provider abstractions, and a reactive frontend. It works, but it is experimental: single-user by design and many of the "smart" behaviors are heuristics I'm still iterating on.
 
 Stack: Angular 21 (signals, standalone components) + FastAPI + MongoDB, with Ollama (or any OpenAI-compatible server) for inference.
 
