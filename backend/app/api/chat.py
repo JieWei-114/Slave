@@ -3,6 +3,7 @@ Chat API
 
 """
 
+import base64
 import json
 import logging
 from datetime import datetime
@@ -44,8 +45,22 @@ router = APIRouter(prefix='/chat', tags=['chat'])
 logger = logging.getLogger(__name__)
 
 
+# Image extensions accepted by the vision pipeline (stored as base64, no
+# text extraction)
+IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.gif')
+
+# HTTP 413 Payload Too Large (not in app constants)
+HTTP_PAYLOAD_TOO_LARGE = 413
+
+
+def is_image_filename(filename: str) -> bool:
+    return (filename or '').lower().endswith(IMAGE_EXTENSIONS)
+
+
 def detect_file_type(filename: str) -> str:
     lower = filename.lower()
+    if lower.endswith(IMAGE_EXTENSIONS):
+        return 'Image'
     if lower.endswith('.pdf'):
         return 'PDF'
     if lower.endswith(('.docx', '.doc')):
@@ -61,8 +76,30 @@ def detect_file_type(filename: str) -> str:
 
 @router.get('/models')
 async def get_available_models():
+    """Return the models actually installed on the provider, so the UI
+    never offers a model that would 404 at generation time."""
     logger.info('Fetching available models')
-    return AVAILABLE_MODELS
+    try:
+        from app.providers import get_provider
+
+        installed = await get_provider().list_models()
+        return [
+            {
+                'id': name,
+                'name': _display_model_name(name),
+                'description': '',
+            }
+            for name in installed
+        ]
+    except Exception as e:
+        logger.error(f'Failed to list installed models: {e}')
+        return []
+
+
+def _display_model_name(model_id: str) -> str:
+    """Human-friendly label: strip hf.co/org prefixes, keep model:quant."""
+    name = model_id.split('/')[-1]
+    return name.replace('-GGUF', '').replace(':latest', '')
 
 
 @router.get('/sessions')
@@ -225,7 +262,9 @@ async def start_new_topic(session_id: str, payload: NewTopicRequest):
 
     """
     try:
-        session = sessions_collection.find_one({'id': session_id}, {'_id': 0, 'messages': 1})
+        session = sessions_collection.find_one(
+            {'id': session_id}, {'_id': 0, 'messages': 1, 'topic_break_at': 1}
+        )
         if not session:
             raise HTTPException(status_code=HTTP_NOT_FOUND, detail='Session not found')
 
@@ -233,6 +272,15 @@ async def start_new_topic(session_id: str, payload: NewTopicRequest):
         if not messages:
             raise HTTPException(
                 status_code=HTTP_BAD_REQUEST, detail='Session has no messages to summarize'
+            )
+
+        # Reject a redundant break: no new messages since the last one
+        # (guards against double-clicks that slip past the UI state)
+        existing_break = session.get('topic_break_at')
+        if existing_break and all(m['created_at'] <= existing_break for m in messages):
+            raise HTTPException(
+                status_code=HTTP_BAD_REQUEST,
+                detail='Already on a new topic — send a message first',
             )
 
         messages = sorted(messages, key=lambda m: m['created_at'])[-NEW_TOPIC_MAX_MESSAGES:]
@@ -370,6 +418,31 @@ async def upload_file(file: UploadFile = File(...)):
     try:
         logger.info(f'Uploading file: {file.filename}')
 
+        # Images: stored as base64, no text extraction
+        if is_image_filename(file.filename):
+            file_content = await file.read()
+            max_image_bytes = settings.VISION_IMAGE_MAX_MB * 1024 * 1024
+            if len(file_content) > max_image_bytes:
+                logger.warning(
+                    f'Image {file.filename} too large: {len(file_content)} bytes'
+                )
+                raise HTTPException(
+                    status_code=HTTP_PAYLOAD_TOO_LARGE,
+                    detail=f'Image too large. Max {settings.VISION_IMAGE_MAX_MB}MB.',
+                )
+            image_b64 = base64.b64encode(file_content).decode('ascii')
+            logger.info(
+                f'Image {file.filename} uploaded: {len(file_content)} bytes (base64 stored)'
+            )
+            return {
+                'content': '',
+                'filename': file.filename,
+                'original_size': len(file_content),
+                'extracted_length': 0,
+                'is_image': True,
+                'image_base64': image_b64,
+            }
+
         # Enforce allowed extensions server-side
         allowed_exts = tuple(ext.lower() for ext in settings.FILE_UPLOAD_ALLOWED_EXTENSIONS)
         if not (file.filename or '').lower().endswith(allowed_exts):
@@ -431,6 +504,39 @@ def attach_file(session_id: str, payload: AttachFileRequest):
 
         filename = payload.filename.strip()
         content = payload.content.strip() if payload.content else ''
+        is_image = payload.is_image or is_image_filename(filename)
+        image_b64 = (payload.image_base64 or '').strip() if is_image else ''
+
+        if is_image:
+            # Images carry base64 data instead of extracted text
+            if not filename or not image_b64:
+                raise HTTPException(
+                    status_code=HTTP_BAD_REQUEST,
+                    detail='filename and image_base64 are required for images',
+                )
+            # base64 expands ~4/3; enforce the pre-encode size cap
+            max_b64_len = settings.VISION_IMAGE_MAX_MB * 1024 * 1024 * 4 // 3 + 4
+            if len(image_b64) > max_b64_len:
+                raise HTTPException(
+                    status_code=HTTP_PAYLOAD_TOO_LARGE,
+                    detail=f'Image too large. Max {settings.VISION_IMAGE_MAX_MB}MB.',
+                )
+            file_record = store_file_attachment(
+                session_id=session_id,
+                filename=filename,
+                content='',
+                file_type='Image',
+                is_image=True,
+                image_base64=image_b64,
+            )
+            logger.info(f'Image attached and stored: {filename} (ID: {file_record["id"]})')
+            return {
+                'status': 'attached',
+                'file_id': file_record['id'],
+                'filename': filename,
+                'length': 0,
+                'is_image': True,
+            }
 
         if not filename or not content:
             raise HTTPException(
@@ -455,6 +561,7 @@ def attach_file(session_id: str, payload: AttachFileRequest):
             'file_id': file_record['id'],
             'filename': filename,
             'length': len(truncated),
+            'is_image': False,
         }
     except HTTPException:
         raise

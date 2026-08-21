@@ -41,15 +41,33 @@ class OpenAICompatProvider(LLMProvider):
         return headers
 
     @staticmethod
-    def _build_messages(prompt: str, system: Optional[str] = None) -> list[dict]:
+    def _build_messages(
+        prompt: str, system: Optional[str] = None, images: Optional[list[str]] = None
+    ) -> list[dict]:
         messages = []
         if system:
             messages.append({'role': 'system', 'content': system})
-        messages.append({'role': 'user', 'content': prompt})
+        if images:
+            # OpenAI vision content parts: text + data-URI image_url parts
+            content_parts = [{'type': 'text', 'text': prompt}]
+            for b64 in images:
+                content_parts.append(
+                    {
+                        'type': 'image_url',
+                        'image_url': {'url': f'data:image/jpeg;base64,{b64}'},
+                    }
+                )
+            messages.append({'role': 'user', 'content': content_parts})
+        else:
+            messages.append({'role': 'user', 'content': prompt})
         return messages
 
     async def stream_chat(
-        self, prompt: str, model: str, system: Optional[str] = None
+        self,
+        prompt: str,
+        model: str,
+        system: Optional[str] = None,
+        images: Optional[list[str]] = None,
     ) -> AsyncIterator[str]:
         """
         Stream response token by token via SSE (stream=true)
@@ -62,7 +80,7 @@ class OpenAICompatProvider(LLMProvider):
         )
         payload = {
             'model': model,
-            'messages': self._build_messages(prompt, system),
+            'messages': self._build_messages(prompt, system, images),
             'stream': True,
         }
 
@@ -113,7 +131,13 @@ class OpenAICompatProvider(LLMProvider):
             logger.error('openai_compat stream request failed: %s', exc)
             raise ProviderStreamError(f'OpenAI-compatible request failed: {exc}') from exc
 
-    async def generate_once(self, prompt: str, model: str, system: Optional[str] = None) -> str:
+    async def generate_once(
+        self,
+        prompt: str,
+        model: str,
+        system: Optional[str] = None,
+        json_schema: Optional[dict] = None,
+    ) -> str:
         """
         Get complete response in one call (non-streaming)
 
@@ -123,6 +147,10 @@ class OpenAICompatProvider(LLMProvider):
             'messages': self._build_messages(prompt, system),
             'stream': False,
         }
+        if json_schema:
+            # Widely-supported JSON mode; schema-strict variants differ per
+            # server, so plain json_object keeps vLLM/llama.cpp/OpenAI happy
+            payload['response_format'] = {'type': 'json_object'}
 
         try:
             async with httpx.AsyncClient(timeout=settings.OLLAMA_TIMEOUT) as client:

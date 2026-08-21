@@ -19,6 +19,7 @@ from app.api.web import router as web_router
 from app.config.settings import settings
 from app.core.auth import require_api_key
 from app.core.db import client
+from app.services.history_vector_service import backfill_history_vectors
 from app.services.memory_service import reindex_memories
 
 logger = logging.getLogger(__name__)
@@ -68,12 +69,26 @@ async def _reindex_vector_store() -> None:
         logger.warning('Startup vector reindex failed: %s', e)
 
 
+async def _backfill_history_vectors() -> None:
+    """Index messages missing history vectors without blocking startup."""
+    try:
+        count = await asyncio.to_thread(backfill_history_vectors)
+        logger.info('Startup history vector backfill done: %s messages indexed', count)
+    except Exception as e:
+        logger.warning('Startup history vector backfill failed: %s', e)
+
+
 @app.on_event('startup')
 async def startup_vector_reindex():
     # Only needed for external vector stores (Mongo store reads embeddings
     # straight from the source-of-truth collection)
     if (settings.VECTOR_STORE or 'mongo').strip().lower() != 'mongo':
         asyncio.create_task(_reindex_vector_store())
+
+    # Semantic history: backfill message vectors for messages saved before
+    # this feature existed (bounded; both backends use a separate collection)
+    if settings.HISTORY_VECTOR_ENABLED:
+        asyncio.create_task(_backfill_history_vectors())
 
 
 @app.get('/')

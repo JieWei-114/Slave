@@ -172,7 +172,11 @@ export class ChatMessageBubbleComponent implements OnChanges {
   private speakHintTimer: ReturnType<typeof setTimeout> | null = null;
 
   get speakTitle(): string {
-    if (this.isSpeakLoading && this.isSpeakDownloadHint) return 'Downloading voice model…';
+    if (this.isSpeakLoading && this.isSpeakDownloadHint) {
+      // "Downloading" only when the model truly isn't cached yet;
+      // otherwise it's just slow synthesis on CPU.
+      return this.voiceApi.ttsReady() ? 'Generating speech…' : 'Downloading voice model…';
+    }
     if (this.isSpeaking) return 'Stop playback';
     if (!this.voiceApi.ttsReady()) return 'First use will download the voice model (~30s)';
     return 'Read message aloud';

@@ -27,10 +27,17 @@ class LLMProvider(ABC):
 
     @abstractmethod
     def stream_chat(
-        self, prompt: str, model: str, system: Optional[str] = None
+        self,
+        prompt: str,
+        model: str,
+        system: Optional[str] = None,
+        images: Optional[list[str]] = None,
     ) -> AsyncIterator[str]:
         """
         Stream response from the LLM token by token.
+
+        images: optional list of base64-encoded images (no 'data:' prefix)
+        for vision-capable models.
 
         Yields plain token strings (same contract as the original stream_ollama).
         Raises ProviderStreamError on failure.
@@ -38,9 +45,19 @@ class LLMProvider(ABC):
         """
 
     @abstractmethod
-    async def generate_once(self, prompt: str, model: str, system: Optional[str] = None) -> str:
+    async def generate_once(
+        self,
+        prompt: str,
+        model: str,
+        system: Optional[str] = None,
+        json_schema: Optional[dict] = None,
+    ) -> str:
         """
         Get complete response from the LLM in one call (non-streaming).
+
+        json_schema, when given, constrains the output to valid JSON matching
+        the schema (Ollama structured outputs / OpenAI json mode) — essential
+        for small models that ignore "output JSON" prompt instructions.
 
         Returns '' on failure (same contract as the original call_ollama_once).
 

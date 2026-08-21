@@ -14,6 +14,7 @@ import {
   DEFAULT_MODEL,
   AIModel,
   MessageMetadata,
+  PlanInfo,
 } from '../services/chat.model';
 import { MemoryStore } from '../../memory/store/memory.store';
 import { MemoryApi } from '../../memory/service/memory.api';
@@ -90,12 +91,6 @@ export class ChatStore {
   readonly currentSession = computed(() => {
     const id = this.currentSessionId();
     return id ? (this.sessions()[id] ?? null) : null;
-  });
-
-  // Get follow-up status from current session's rules (default: true — server default)
-  readonly followUpEnabled = computed(() => {
-    const session = this.currentSession();
-    return session?.rules?.followUpEnabled ?? true;
   });
 
   // Loading state for the "New Topic" request
@@ -238,16 +233,8 @@ export class ChatStore {
   }
 
   /**
-   * Follow-up & Metadata
+   * Rules & Metadata
    */
-
-  /**
-   * Toggle follow-up context usage for current session
-   * Updates session-specific rules in backend
-   */
-  toggleFollowUp(): void {
-    this.toggleRule('followUpEnabled', 'follow-up');
-  }
 
   /**
    * Toggle reasoning generation for the current session.
@@ -261,7 +248,7 @@ export class ChatStore {
    * Toggle a boolean rule on the current session with optimistic update,
    * backend persistence, and revert on failure.
    */
-  private toggleRule(key: 'followUpEnabled' | 'reasoningEnabled', label: string): void {
+  private toggleRule(key: 'reasoningEnabled', label: string): void {
     const session = this.currentSession();
     if (!session) return;
 
@@ -435,13 +422,15 @@ export class ChatStore {
     const nextDraft = this.draftBySession()[id] ?? '';
     this.draftMessage.set(nextDraft);
 
-    // Load model for this session from localStorage
+    // Load model for this session from localStorage, but never pick a
+    // model that isn't actually installed (would 404 at the provider)
+    const installed = this.availableModels();
     const savedModel = this.loadModelFromLocalStorage(id);
-    if (savedModel) {
-      this.currentModel.set(savedModel);
+    const candidate = savedModel ?? DEFAULT_MODEL;
+    if (installed.length === 0 || installed.some((m) => m.id === candidate.id)) {
+      this.currentModel.set(candidate);
     } else {
-      // Fall back to default model if none saved
-      this.currentModel.set(DEFAULT_MODEL);
+      this.currentModel.set(installed[0]);
     }
 
     const session = this.sessions()[id];
@@ -770,7 +759,10 @@ export class ChatStore {
           (err: unknown) => {
             // Stream failed: surface the error instead of pretending success
             this.logError(`Message streaming failed for session ${sessionId}: ${err}`);
-            this.error.set('Failed to stream response');
+            const message = err instanceof Error ? err.message : '';
+            this.error.set(
+              message.toLowerCase().includes('vision') ? message : 'Failed to stream response',
+            );
             this.loading.set(false);
             this.stopStreaming = null;
             this.verificationStatus.set({ type: 'idle' });
@@ -781,6 +773,20 @@ export class ChatStore {
               if (assistantIndex >= 0 && assistantIndex < msgs.length) {
                 msgs.splice(assistantIndex, 1);
               }
+              return { ...s, [sessionId]: { ...s[sessionId], messages: msgs } };
+            });
+          },
+          (plan: PlanInfo) => {
+            // Store the latest retrieval plan on the streaming message's meta
+            this.sessions.update((s: Record<string, ChatSession>) => {
+              const msgs = [...s[sessionId].messages];
+              msgs[assistantIndex] = {
+                ...msgs[assistantIndex],
+                meta: {
+                  ...(msgs[assistantIndex].meta ?? {}),
+                  plan,
+                },
+              };
               return { ...s, [sessionId]: { ...s[sessionId], messages: msgs } };
             });
           },

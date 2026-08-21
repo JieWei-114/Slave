@@ -7,7 +7,6 @@ from pydantic import BaseModel, Field
 
 class ContextSource(str, Enum):
     # Enumeration of context sources user can select
-    FOLLOW_UP = 'follow-up'
     MEMORY = 'memory'
     FILE = 'file'
     HISTORY = 'history'
@@ -89,8 +88,9 @@ class RulesConfig(BaseModel):
     fileUploadMaxChars: int | None = None
 
     customInstructions: str = ''
-    followUpEnabled: bool = True
     reasoningEnabled: bool = False
+    # NOTE: legacy 'followUpEnabled' may still exist in stored rules docs;
+    # Pydantic ignores unknown keys by default, so it is silently dropped.
 
 
 class ReorderSessionsRequest(BaseModel):
@@ -114,4 +114,8 @@ class FileAttachment(BaseModel):
 
 class AttachFileRequest(BaseModel):
     filename: str
-    content: str
+    content: str = ''
+    # Image attachments: base64-encoded image data (no 'data:' prefix).
+    # Images carry no extracted text content.
+    is_image: bool = False
+    image_base64: str | None = None

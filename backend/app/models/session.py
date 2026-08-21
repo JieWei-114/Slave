@@ -13,7 +13,6 @@ class SessionRules(BaseModel):
     serper: bool = False
     tavilyExtract: bool = False
     localExtract: bool = True
-    followUpEnabled: bool = True
     reasoningEnabled: bool = False
 
 

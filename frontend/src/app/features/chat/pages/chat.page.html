@@ -106,7 +106,7 @@
           #fileInput
           class="file-input"
           type="file"
-          accept=".txt,.md,.json,.csv,.log,.html,.css,.ts,.js,.py,.yaml,.yml,.pdf,.doc,.docx,text/*,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+          accept=".txt,.md,.json,.csv,.log,.html,.css,.ts,.js,.py,.yaml,.yml,.pdf,.doc,.docx,.png,.jpg,.jpeg,.webp,.gif,text/*,image/*,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
           (change)="onFileSelected($event)"
           [disabled]="store.loading()"
         />
@@ -177,10 +177,21 @@
       class="file-meta"
       *ngIf="selectedFileName() || fileError() || voiceError() || voiceDownloadHint()"
     >
-      <span *ngIf="selectedFileName()">Attached: {{ selectedFileName() }}</span>
+      <img
+        *ngIf="imagePreviewUrl()"
+        class="image-preview"
+        [src]="imagePreviewUrl()"
+        [alt]="selectedFileName()"
+        [title]="selectedFileName()"
+      />
+      <span *ngIf="selectedFileName() && !imagePreviewUrl()"
+        >Attached: {{ selectedFileName() }}</span
+      >
       <span *ngIf="fileError()" class="file-error">{{ fileError() }}</span>
       <span *ngIf="voiceError()" class="file-error">{{ voiceError() }}</span>
-      <span *ngIf="voiceDownloadHint() && isTranscribing()">Downloading voice model…</span>
+      <span *ngIf="voiceDownloadHint() && isTranscribing()">{{
+        voiceApi.sttReady() ? 'Transcribing your voice…' : 'Downloading voice model (first use)…'
+      }}</span>
     </div>
   </div>
 </div>

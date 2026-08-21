@@ -205,6 +205,30 @@ def list_memories_by_category(chat_sessionId: str, category: str):
     return [serialize_memory(doc) for doc in cursor]
 
 
+def list_enabled_memories(chat_sessionId: str, limit: int = 50):
+    """
+    All enabled memories for a session, newest first.
+
+    Used when the planner asks for memory context: with a small corpus,
+    injecting everything beats similarity search — broad questions like
+    "what do you know about me?" score only ~0.15-0.3 cosine against short
+    facts ("male", "25 years old"), so any threshold drops them.
+
+    """
+    cursor = (
+        synthesized_memory_collection.find(
+            {
+                'session_id': chat_sessionId,
+                'is_deprecated': {'$ne': True},
+                '$or': [{'enabled': True}, {'enabled': {'$exists': False}}],
+            }
+        )
+        .sort('created_at', -1)
+        .limit(limit)
+    )
+    return [serialize_memory(doc) for doc in cursor]
+
+
 def delete_memory(memory_id: str):
     """
     Permanently delete a memory item.
@@ -441,15 +465,17 @@ def should_remember(user_text: str, assistant_text: str) -> bool:
     if len(user_text) + len(assistant_text) < min_conversation:
         return False
 
-    # Check for reject patterns (case-insensitive, whole message)
-    reject_patterns = ['dont remember']
-    normalized = assistant_text.lower().strip()
-    if any(pattern in normalized for pattern in reject_patterns):
+    # Patterns are matched against the USER's message — it's the user who
+    # asks to remember, not the assistant.
+    user_normalized = user_text.lower().strip()
+
+    reject_patterns = ["don't remember", 'dont remember', 'do not remember', '不要记']
+    if any(pattern in user_normalized for pattern in reject_patterns):
         return False
 
-    # Check for explicit remember requests
-    accept_patterns = ['remember', 'save this', 'keep in mind']
-    if any(pattern in normalized for pattern in accept_patterns):
+    # Explicit remember requests from the user
+    accept_patterns = ['remember', 'save this', 'keep in mind', '记住', '记一下']
+    if any(pattern in user_normalized for pattern in accept_patterns):
         return True
 
     # Default: do NOT remember unless a pattern/heuristic indicated we should

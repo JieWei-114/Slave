@@ -22,9 +22,6 @@ export interface RulesConfig {
   // Custom AI behavior
   customInstructions?: string;
 
-  // Follow-up context (default: false)
-  followUpEnabled?: boolean;
-
   // Reasoning generation (default: false)
   reasoningEnabled?: boolean;
 }
@@ -46,9 +43,6 @@ export const DEFAULT_RULES: RulesConfig = {
 
   // Custom instructions (empty by default)
   customInstructions: '',
-
-  // Follow-up context (disabled by default)
-  followUpEnabled: false,
 
   // Reasoning generation (disabled by default)
   reasoningEnabled: false,

@@ -21,11 +21,17 @@ _model = SentenceTransformer(
 )
 
 
-def embed(texts: Iterable[str], normalize: bool = True) -> list[list[float]]:
+def embed(texts: Iterable[str] | str, normalize: bool = True) -> list[list[float]]:
     """
-    Convert text strings to embedding vector
+    Convert text strings to embedding vectors.
+
+    Accepts a single string or an iterable of strings. A bare string MUST
+    be wrapped here: list("abc") explodes into per-character items, which
+    silently embeds single letters instead of the sentence.
 
     """
+    if isinstance(texts, str):
+        texts = [texts]
     embeddings = _model.encode(
         list(texts),
         convert_to_numpy=True,

@@ -6,11 +6,9 @@ import uuid
 from datetime import datetime
 
 from app.config.prompt_templates import (
-    CONTINUATION_HINT_FOLLOWUP,
     FILE_CONTEXT_INSTRUCTION,
     HISTORY_CONTEXT_HEADER,
     MEMORY_CONTEXT_HEADER,
-    PRIMARY_CONTEXT_HEADER,
     REASONING_PHASE_SYSTEM,
     WEB_CONTEXT_HEADER,
 )
@@ -25,6 +23,7 @@ from app.services.chat_session_service import (
     list_sessions, 
     rename_session,
     )
+from app.services.context_planner import build_fallback_plan, plan_context
 from app.services.context_builder_service import (
     calculate_weighted_confidence,
     extract_file_content,
@@ -40,13 +39,20 @@ from app.services.file_extraction_service import (
     get_file_attachment,
     list_file_attachments,
 )
+from app.services.history_vector_service import (
+    index_message as index_history_message,
+)
+from app.services.history_vector_service import (
+    search_history as search_history_vectors,
+)
 from app.services.memory_service import (
     add_synthesized_memory,
     auto_memory_if_needed,
+    list_enabled_memories,
     list_memories_by_category,
     search_memories,
 )
-from app.services.ollama_service import stream_ollama
+from app.services.ollama_service import ProviderStreamError, stream_ollama
 from app.services.reasoning_veto_service import assess_reasoning_veto
 from app.services.web_search_service import maybe_extract, maybe_web_search
 from app.utils.reasoning_utils import ReasoningTracker
@@ -70,6 +76,9 @@ MAX_ASSISTANT_CONTEXT = settings.CHAT_HISTORY_MAX_ASSISTANT_CONTEXT
 
 # Memory limits
 MEMORY_RESULTS_LIMIT = settings.CHAT_MEMORY_RESULTS_LIMIT
+# At or below this many enabled memories, inject all of them instead of
+# similarity-searching (see _build_memory_context)
+SMALL_MEMORY_CORPUS_LIMIT = 30
 MEMORY_TOTAL_MAX = settings.CHAT_MEMORY_TOTAL_MAX_CHARS
 
 # Web search limits
@@ -89,7 +98,6 @@ SYSTEM_INSTRUCTIONS = settings.CHAT_SYSTEM_INSTRUCTIONS
 
 # Confidence scoring (source-based)
 CONFIDENCE_FILE = settings.CONFIDENCE_FILE
-CONFIDENCE_FOLLOW_UP = settings.CONFIDENCE_FOLLOW_UP
 CONFIDENCE_MEMORY = settings.CONFIDENCE_MEMORY
 CONFIDENCE_HISTORY = settings.CONFIDENCE_HISTORY
 CONFIDENCE_WEB = settings.CONFIDENCE_WEB
@@ -210,48 +218,70 @@ def _filter_messages_after_topic_break(messages: list[dict], topic_break_at) -> 
     return [m for m in messages if m.get('created_at') and m['created_at'] > topic_break_at]
 
 
-def _get_primary_assistant_answer(session_id: str) -> str:
+def retrieve_semantic_history(
+    session_id: str,
+    history_query: str | None,
+    exclude_ids: set[str] | None = None,
+    exclude_created_ats: set[str] | None = None,
+) -> list[dict]:
     """
-    Retrieve most recent assistant response from conversation history.
+    Semantic retrieval over the full conversation history.
 
-    Used for follow-up detection and reference resolution.
-    Messages before a topic break are ignored.
+    Embeds `history_query` and searches the history vector store (filtered by
+    session), excluding messages already in the recency window. Returns up to
+    4 hits above the similarity threshold as [{role, content, created_at}].
+    Blocking (embedding + store search) — async callers wrap in asyncio.to_thread.
 
     """
+    if not settings.HISTORY_VECTOR_ENABLED or not (history_query or '').strip():
+        return []
     try:
-        session = sessions_collection.find_one(
-            {'id': session_id}, {'_id': 0, 'messages': 1, 'topic_break_at': 1}
+        return search_history_vectors(
+            session_id=session_id,
+            query=history_query,
+            exclude_ids=exclude_ids,
+            exclude_created_ats=exclude_created_ats,
         )
-        if not session or not session.get('messages'):
-            return None
-
-        messages = _filter_messages_after_topic_break(
-            session['messages'], session.get('topic_break_at')
-        )
-        for msg in reversed(messages):
-            if msg.get('role') == 'assistant' and msg.get('content', '').strip():
-                return msg['content']
-        return None
     except Exception as e:
-        logger.warning(f'Failed to retrieve primary answer: {e}')
-        return None
+        logger.warning(
+            f'Semantic history retrieval failed: {e}', extra={'session_id': session_id}
+        )
+        return []
+
+
+def _index_message_vector(session_id: str, message: dict) -> None:
+    """Embed + upsert a saved message into the history vector store (best effort)."""
+    if not settings.HISTORY_VECTOR_ENABLED:
+        return
+    try:
+        index_history_message(
+            session_id=session_id,
+            message_id=message['id'],
+            role=message.get('role', ''),
+            content=message.get('content', ''),
+            created_at=message.get('created_at'),
+        )
+    except Exception as e:
+        logger.warning(
+            f'Failed to index message vector: {e}', extra={'session_id': session_id}
+        )
 
 
 async def build_prompt_with_memory(
     user_content: str,
     chat_sessionId: str = 'default',
+    plan: dict | None = None,
 ) -> tuple[str, str, dict]:
     """
     MAIN ENTRY POINT: Build Complete Augmented Prompt with Multi-Source Context
 
-    This orchestrates ALL context sources:
+    This orchestrates ALL context sources, guided by the context planner's plan:
       1. Session configuration (rules, limits, custom instructions)
-      2. File attachments (inline + stored)
+      2. File attachments (inline + stored, filtered by plan['relevant_files'])
       3. URL extraction (if URLs in message)
-      4. Conversation history (for continuity)
-      5. Semantic memory (past knowledge)
-      6. Web search (factual grounding)
-      7. Follow-up detection (reference resolution)
+      4. Conversation history (recent window)
+      5. Semantic memory (plan['memory_query'])
+      6. Web search (plan['web_queries'])
 
     """
 
@@ -280,15 +310,13 @@ async def build_prompt_with_memory(
     local_memory_limit = config.get('memorySearchLimit') or MEMORY_RESULTS_LIMIT
     local_file_limit = config.get('fileUploadMaxChars') or FILE_CONTENT_MAX
     custom_instructions = config.get('customInstructions', '')
-    follow_up_enabled = config.get('followUpEnabled', True)
 
     logger.info(
-        'Config loaded: web=%s, hist=%s, mem=%s, file=%s, follow_up=%s',
+        'Config loaded: web=%s, hist=%s, mem=%s, file=%s',
         local_web_limit,
         local_history_limit,
         local_memory_limit,
         local_file_limit,
-        follow_up_enabled,
         extra={'session_id': chat_sessionId},
     )
 
@@ -320,14 +348,22 @@ async def build_prompt_with_memory(
     logger.info('Files collected: %s', len(file_infos), extra={'session_id': chat_sessionId})
 
     # ─────────────────────────────────────────────────────────────────────
-    # Step 5: Get primary assistant answer for follow-up
+    # Step 5: Resolve the context plan
     # ─────────────────────────────────────────────────────────────────────
-    primary_answer = _get_primary_assistant_answer(chat_sessionId)
-    if primary_answer:
+    if plan is None:
+        plan = build_fallback_plan(user_content, file_infos)
+
+    # Filter files by the plan (fallback plan / inline files keep everything)
+    if not plan.get('fallback') and file_infos:
+        relevant_names = set(plan.get('relevant_files') or [])
+        file_infos = [
+            f
+            for f in file_infos
+            if not f.get('id')  # inline file from this message: always keep
+            or f.get('filename') in relevant_names
+        ]
         logger.info(
-            'Primary answer: %s chars available',
-            len(primary_answer),
-            extra={'session_id': chat_sessionId},
+            'Files after plan filter: %s', len(file_infos), extra={'session_id': chat_sessionId}
         )
 
     # ─────────────────────────────────────────────────────────────────────
@@ -380,7 +416,6 @@ async def build_prompt_with_memory(
         session_id=chat_sessionId,
         source=ContextSource.HISTORY,
         context_limits=context_limits,
-        follow_up_enabled=follow_up_enabled,
     )
     if hist_result['content']:
         blocks.append(hist_result['content'])
@@ -388,6 +423,33 @@ async def build_prompt_with_memory(
         logger.info(
             'History: %s msgs',
             hist_result['metadata'].get('messages_count', 0),
+            extra={'session_id': chat_sessionId},
+        )
+
+    # 7.2a: Semantic history retrieval (contextual, like history) — older
+    # messages beyond the recency window matching the planner's history_query
+    semantic_history_hits = []
+    if plan.get('history_query'):
+        semantic_history_hits = await asyncio.to_thread(
+            retrieve_semantic_history,
+            chat_sessionId,
+            plan.get('history_query'),
+            set(hist_result['metadata'].get('included_ids') or []),
+            set(hist_result['metadata'].get('included_created_ats') or []),
+        )
+    if semantic_history_hits:
+        sem_lines = []
+        for hit in semantic_history_hits:
+            role = (hit.get('role') or '').upper()
+            date = (hit.get('created_at') or '')[:10]
+            sem_lines.append(f'[{role} @ {date}] {hit.get("content", "")}')
+        blocks.append(
+            'RELEVANT EARLIER CONVERSATION (contextual, non-factual)\n' + '\n'.join(sem_lines)
+        )
+        sources_considered['semantic_history'] = CONFIDENCE_HISTORY
+        logger.info(
+            'Semantic history: %s msgs',
+            len(semantic_history_hits),
             extra={'session_id': chat_sessionId},
         )
 
@@ -411,14 +473,13 @@ async def build_prompt_with_memory(
             'Overview: %s chars', len(topic_summary), extra={'session_id': chat_sessionId}
         )
 
-    # 7.3: Build WEB context (factual source)
+    # 7.3: Build WEB context (factual source) — only the planner's queries
     web_result = await build_context_for_source(
         session_id=chat_sessionId,
         source=ContextSource.WEB,
         user_content=user_content,
-        extracted_key_points=extracted_key_points,
+        web_queries=plan.get('web_queries') or [],
         context_limits=context_limits,
-        follow_up_enabled=follow_up_enabled,
     )
     if web_result['content']:
         blocks.append(web_result['content'])
@@ -430,14 +491,19 @@ async def build_prompt_with_memory(
             extra={'session_id': chat_sessionId},
         )
 
-    # 7.4: Build MEMORY context (factual source)
-    mem_result = await build_context_for_source(
-        session_id=chat_sessionId,
-        source=ContextSource.MEMORY,
-        user_content=user_content,
-        context_limits=context_limits,
-        follow_up_enabled=follow_up_enabled,
-    )
+    # 7.4: Build MEMORY context (factual source) — planner's memory_query.
+    # Search with BOTH the planner's phrase and the raw user message: the
+    # planner (a small model) often words the query too abstractly to match.
+    memory_query = plan.get('memory_query')
+    if memory_query:
+        mem_result = await build_context_for_source(
+            session_id=chat_sessionId,
+            source=ContextSource.MEMORY,
+            user_content=[memory_query, user_content],
+            context_limits=context_limits,
+        )
+    else:
+        mem_result = {'content': '', 'confidence': 0.0, 'metadata': {'items_count': 0}}
     if mem_result['content']:
         blocks.append(mem_result['content'])
         factual_blocks.append(mem_result['content'])
@@ -458,7 +524,6 @@ async def build_prompt_with_memory(
                 selected_file_id=finfo.get('id'),
                 file_info=finfo,
                 context_limits=context_limits,
-                follow_up_enabled=follow_up_enabled,
             )
             if fres['content']:
                 file_blocks.append(fres['content'])
@@ -468,23 +533,6 @@ async def build_prompt_with_memory(
 
         if file_blocks:
             blocks = file_blocks + blocks
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Step 8: Determine follow-up mode (after source collection)
-    # ─────────────────────────────────────────────────────────────────────
-    is_follow_up = False
-    continuation_hint = ''
-
-    if follow_up_enabled and primary_answer:
-        is_follow_up = True
-        continuation_hint = CONTINUATION_HINT_FOLLOWUP
-
-        # Insert PRIMARY CONTEXT for reference resolution
-        ins_at = 1 if file_infos else 0
-        blocks.insert(ins_at, PRIMARY_CONTEXT_HEADER + '\n\n' + primary_answer)
-        logger.info(
-            'Follow-up mode ACTIVE: Primary context injected', extra={'session_id': chat_sessionId}
-        )
 
     # ─────────────────────────────────────────────────────────────────────
     # Step 9: Freeze source snapshot
@@ -510,11 +558,12 @@ async def build_prompt_with_memory(
         'history': {
             'available': 'history' in sources_considered,
         },
+        'semantic_history': {
+            'available': len(semantic_history_hits) > 0,
+            'count': len(semantic_history_hits),
+        },
         'overview': {
             'available': bool(topic_summary),
-        },
-        'follow_up': {
-            'available': is_follow_up,
         },
     }
 
@@ -549,23 +598,9 @@ async def build_prompt_with_memory(
     # ─────────────────────────────────────────────────────────────────────
     # Step 11: Build final prompt
     # ─────────────────────────────────────────────────────────────────────
-    summary = f"""CONTEXT SUMMARY
-Query: {user_content[:100]}{'...' if len(user_content) > 100 else ''}
-Sources: {', '.join(sources_considered.keys())}
-Files: {len(file_infos)}
-Confidence: {overall_confidence:.2f}"""
-
     context = '\n\n'.join(blocks) if blocks else 'No context available.'
 
-    prompt = f"""{continuation_hint}
-
-{'=' * 80}
-
-{summary}
-
-{'=' * 80}
-
-{context}
+    prompt = f"""{context}
 
 {'=' * 80}
 
@@ -596,8 +631,7 @@ A:
         'loaded_sources': loaded_sources,
         'has_factual_content': any(s in sources_considered for s in ['file', 'memory', 'web']),
         'factual_context_blocks': factual_blocks,  # Keep for entity validation
-        'followup_enabled': follow_up_enabled,
-        'is_follow_up': is_follow_up,
+        'plan': plan,
         'context_details': {
             'file_count': len(file_infos),
             'web_count': web_result['metadata'].get('results_count', 0)
@@ -621,12 +655,10 @@ async def build_context_for_source(
     session_id: str,
     source: ContextSource,
     user_content: str = '',
-    primary_assistant_answer: str | None = None,
-    extracted_key_points: list[str] | None = None,
+    web_queries: list[str] | None = None,
     selected_file_id: str | None = None,
     file_info: dict | None = None,
     context_limits: dict | None = None,
-    follow_up_enabled: bool = True,
 ) -> dict:
     """
     Assemble context from a single source.
@@ -666,10 +698,8 @@ async def build_context_for_source(
             return await _build_history_context(session_id, context_limits)
         elif source == ContextSource.WEB:
             return await _build_web_context(
-                session_id, user_content, extracted_key_points, context_limits
+                session_id, user_content, web_queries or [], context_limits
             )
-        elif source == ContextSource.FOLLOW_UP:
-            return _build_followup_context(primary_assistant_answer)
         else:
             return {
                 'content': '',
@@ -747,19 +777,37 @@ Size: {len(content)} characters
         }
 
 
-async def _build_memory_context(session_id: str, query: str, limits: dict) -> dict:
-    """Build context from semantic memories."""
+async def _build_memory_context(session_id: str, query: str | list, limits: dict) -> dict:
+    """Build context from semantic memories.
+
+    query may be a single phrase or a list of phrases — every phrase is
+    searched and hits are merged (planner phrase + raw user message).
+    """
     try:
-        # Run blocking embedding + Mongo work off the event loop
-        important_memories = await asyncio.to_thread(
-            list_memories_by_category, session_id, 'important'
-        )
-        memories = await asyncio.to_thread(
-            search_memories,
-            session_id,
-            query,
-            limits.get('memory_items', MEMORY_RESULTS_LIMIT),
-        )
+        queries = [q for q in (query if isinstance(query, list) else [query]) if q]
+        # Run blocking embedding + Mongo work off the event loop.
+        # Small corpus → inject ALL enabled memories: similarity search
+        # can't bridge broad questions ("what do you know about me?") and
+        # short facts ("male") — real cosine is ~0.15-0.3, below any sane
+        # threshold. Only fall back to semantic search on large corpora.
+        all_memories = await asyncio.to_thread(list_enabled_memories, session_id)
+        if len(all_memories) <= SMALL_MEMORY_CORPUS_LIMIT:
+            important_memories = all_memories
+            memory_hits = []
+        else:
+            important_memories = await asyncio.to_thread(
+                list_memories_by_category, session_id, 'important'
+            )
+            memory_hits = []
+            for q in queries:
+                memory_hits.extend(
+                    await asyncio.to_thread(
+                        search_memories,
+                        session_id,
+                        q,
+                        limits.get('memory_items', MEMORY_RESULTS_LIMIT),
+                    )
+                )
 
         combined = []
         seen_ids = set()
@@ -771,7 +819,7 @@ async def _build_memory_context(session_id: str, query: str, limits: dict) -> di
             seen_ids.add(mem_id)
             combined.append(m)
 
-        for m in memories:
+        for m in memory_hits:
             mem_id = m.get('id') or m.get('_id')
             if mem_id in seen_ids:
                 continue
@@ -825,6 +873,17 @@ async def _build_memory_context(session_id: str, query: str, limits: dict) -> di
         }
 
 
+def _truncate_at_word(text: str, max_chars: int) -> str:
+    """Truncate text at a word boundary (last space) instead of mid-word."""
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    last_space = cut.rfind(' ')
+    if last_space > 0:
+        cut = cut[:last_space]
+    return cut + '…'
+
+
 async def _build_history_context(session_id: str, limits: dict) -> dict:
     """Build context from conversation history."""
     try:
@@ -853,10 +912,19 @@ async def _build_history_context(session_id: str, limits: dict) -> dict:
             }
 
         lines = []
+        included_ids = []
+        included_created_ats = []
         for msg in to_include:
             role = msg.get('role', '').upper()
-            content = msg.get('content', '')[:HISTORY_MAX_PER_MSG]
+            content = _truncate_at_word(msg.get('content', ''), HISTORY_MAX_PER_MSG)
             lines.append(f'{role}: {content}')
+            if msg.get('id'):
+                included_ids.append(msg['id'])
+            created_at = msg.get('created_at')
+            if isinstance(created_at, datetime):
+                included_created_ats.append(created_at.isoformat())
+            elif created_at:
+                included_created_ats.append(str(created_at))
 
         formatted = HISTORY_CONTEXT_HEADER + '\n' + '\n'.join(lines)
 
@@ -864,7 +932,12 @@ async def _build_history_context(session_id: str, limits: dict) -> dict:
             'content': formatted,
             'confidence': CONFIDENCE_HISTORY,
             'source': ContextSource.HISTORY,
-            'metadata': {'messages_count': len(lines)},
+            'metadata': {
+                'messages_count': len(lines),
+                # Used to exclude the recency window from semantic history
+                'included_ids': included_ids,
+                'included_created_ats': included_created_ats,
+            },
             'warning': None,
         }
     except Exception as e:
@@ -878,33 +951,45 @@ async def _build_history_context(session_id: str, limits: dict) -> dict:
         }
 
 
-async def _build_web_context(session_id: str, query: str, key_points: list, limits: dict) -> dict:
-    """Build context from web search results."""
+async def _build_web_context(
+    session_id: str, query: str, web_queries: list[str], limits: dict
+) -> dict:
+    """Build context from web search results using the planner's queries only."""
     try:
-        # Build search queries: primary + key points
-        search_queries = [query]
-        if key_points and isinstance(key_points, list):
-            # Only add if key_points are strings
-            for kp in key_points[:2]:
-                if isinstance(kp, str):
-                    search_queries.append(kp)
+        search_queries = [
+            sq.strip() for sq in (web_queries or []) if isinstance(sq, str) and sq.strip()
+        ]
+        if not search_queries:
+            # Planner decided web search is not needed
+            return {
+                'content': '',
+                'confidence': 0.0,
+                'source': ContextSource.WEB,
+                'metadata': {'results_count': 0, 'skipped': True},
+                'warning': None,
+            }
 
         logger.debug(
             f'Web search with {len(search_queries)} queries', extra={'session_id': session_id}
         )
 
         results = []
+        seen_results = set()
         for sq in search_queries[:3]:
-            if not isinstance(sq, str) or not sq.strip():
-                logger.warning(
-                    f'Skipping invalid search query: {type(sq)}', extra={'session_id': session_id}
-                )
-                continue
-
             try:
                 res = await maybe_web_search(sq, session_id=session_id)
                 if res and isinstance(res, list):
-                    results.extend(res[: limits.get('web_results', WEB_RESULTS_LIMIT)])
+                    for r in res[: limits.get('web_results', WEB_RESULTS_LIMIT)]:
+                        # Dedupe merged results across queries (by url or snippet)
+                        key = (
+                            (r.get('url') or r.get('snippet', ''))
+                            if isinstance(r, dict)
+                            else str(r)
+                        )
+                        if key in seen_results:
+                            continue
+                        seen_results.add(key)
+                        results.append(r)
                 if len(results) >= limits.get('web_results', WEB_RESULTS_LIMIT):
                     break
             except Exception as e:
@@ -974,97 +1059,48 @@ async def _build_web_context(session_id: str, query: str, key_points: list, limi
         }
 
 
-def _build_followup_context(primary_answer: str) -> dict:
-    """Build follow-up reference context."""
-    if not primary_answer:
-        return {
-            'content': '',
-            'confidence': 0.0,
-            'source': ContextSource.FOLLOW_UP,
-            'metadata': {},
-            'warning': 'No previous answer',
-        }
-
-    return {
-        'content': PRIMARY_CONTEXT_HEADER + '\n\n' + primary_answer,
-        'confidence': CONFIDENCE_FOLLOW_UP,
-        'source': ContextSource.FOLLOW_UP,
-        'metadata': {'answer_length': len(primary_answer)},
-        'warning': None,
-    }
-
-
 # ════════════════════════════════════════════════════════════════════════════════
 # RESPONSE GENERATION & VALIDATION
 # ════════════════════════════════════════════════════════════════════════════════
 
 
-def _build_reasoning_prompt(
-    user_query: str,
-    assistant_answer: str,
-    sources_used: dict,
-    loaded_sources: dict,
-    confidence: float,
-    unverified_count: int,
-    guard_eval: dict,
-    is_follow_up: bool = False,
-    primary_answer: str = None,
-) -> str:
+def _format_plan_summary(plan: dict) -> str:
     """
-    Build a prompt asking the model to explain its reasoning process.
-
-    This generates a self-reflective prompt where the model analyzes
-    how it arrived at the answer it just gave.
+    Render the planner's decisions as a short server-side text line so the plan
+    is visibly part of the streamed reasoning (no model call involved).
     """
-    # Build source summary
-    source_summary = []
-    if 'file' in sources_used:
-        file_count = loaded_sources.get('file', {}).get('count', 0)
-        source_summary.append(f'- FILE: {file_count} file(s)')
-    if 'memory' in sources_used:
-        mem_count = loaded_sources.get('memory', {}).get('count', 0)
-        source_summary.append(f'- MEMORY: {mem_count} item(s)')
-    if 'web' in sources_used:
-        web_count = loaded_sources.get('web', {}).get('count', 0)
-        source_summary.append(f'- WEB: {web_count} result(s)')
-    if 'history' in sources_used:
-        source_summary.append('- HISTORY: Conversation context')
-    if 'url-extract' in sources_used:
-        source_summary.append('- URL: Extracted content')
-    if is_follow_up and primary_answer:
-        source_summary.append(
-            f'- FOLLOW-UP MODE HAS BEEN APPLIED: Previous answer available as primary context ({len(primary_answer)} chars)'
-        )
-
-    sources_text = (
-        '\n'.join(source_summary)
-        if source_summary
-        else 'No external sources (used training knowledge)'
+    plan = plan or {}
+    web = plan.get('web_queries') or []
+    memory = plan.get('memory_query') or ''
+    history = plan.get('history_query') or ''
+    files = plan.get('relevant_files') or []
+    return (
+        f'Plan: web={web} | '
+        f"memory='{memory}' | "
+        f"history='{history}' | "
+        f'files={files}\n\n'
     )
 
-    risk = guard_eval.get('risk', 'NONE') if guard_eval else 'NONE'
-    risk_text = (
-        f'{risk} (found {unverified_count} unverified entities)' if unverified_count > 0 else 'NONE'
+
+def _build_thinking_prompt(final_prompt: str) -> str:
+    """
+    Build the think-first prompt: same context sections as the answer prompt
+    plus a compact instruction to reason BEFORE answering.
+    """
+    return f'{final_prompt}\n\n{REASONING_PHASE_SYSTEM.strip()}\n'
+
+
+def _build_answer_prompt_with_reasoning(final_prompt: str, reasoning_text: str) -> str:
+    """
+    Build the answer prompt: same context plus the full reasoning text, with an
+    instruction to now produce ONLY the final user-facing answer.
+    """
+    return (
+        f'{final_prompt}\n\n'
+        f'YOUR ANALYSIS (use this to answer):\n{reasoning_text.strip()}\n\n'
+        'Now give ONLY the final user-facing answer. '
+        'No step numbering, no meta commentary about your analysis.\n'
     )
-
-    reasoning_phase = REASONING_PHASE_SYSTEM
-
-    prompt = f"""You just answered a user's question. Now explain your reasoning process step by step.
-
-USER ASKED: "{user_query}"
-
-YOUR ANSWER WAS: "{assistant_answer[:800]}{'...' if len(assistant_answer) > 800 else ''}"
-
-SOURCES YOU HAD AVAILABLE:
-{sources_text}
-
-YOUR CONFIDENCE: {confidence:.0%}
-VERIFICATION RISK: {risk_text}
-
-{reasoning_phase}
-"""
-
-    return prompt
 
 
 def rewrite_for_verification(
@@ -1119,12 +1155,12 @@ async def stream_chat_reply(
 
     Flow:
       1. Build augmented prompt with all context
-      2. Stream answer from model
-      3. Validate against factual sources
-      4. Apply system-level verification
-      5. Save to database
-      6. Auto-save important memories
-      7. Generate reasoning (if enabled)
+      2. Think-first reasoning pass (if enabled), streamed as reasoning tokens
+      3. Stream answer from model (informed by the reasoning)
+      4. Validate against factual sources
+      5. Apply system-level verification
+      6. Save to database
+      7. Auto-save important memories
     """
     # ─────────────────────────────────────────────────────────────────────
     # Step 0: Initialize reasoning tracker
@@ -1144,6 +1180,7 @@ async def stream_chat_reply(
     # Step 1: Save user message
     # ─────────────────────────────────────────────────────────────────────
     user_msg = {
+        'id': user_message_id,  # stable id for semantic history vectors
         'role': 'user',
         'content': content,
         'created_at': datetime.utcnow(),
@@ -1173,6 +1210,9 @@ async def stream_chat_reply(
     )
     logger.info('User message saved', extra={'session_id': session_id})
 
+    # Embed the user message for semantic history (best effort, never blocks chat)
+    await asyncio.to_thread(_index_message_vector, session_id, user_msg)
+
     reasoning_tracker.log_step(
         thought='User message received and saved',
         action='SAVE_MESSAGE',
@@ -1182,11 +1222,57 @@ async def stream_chat_reply(
     )
 
     # ─────────────────────────────────────────────────────────────────────
-    # Step 2: Build augmented prompt
+    # Step 2a: Plan context retrieval (before building any context)
+    # ─────────────────────────────────────────────────────────────────────
+    yield json.dumps({'type': 'planning'})
+
+    recent_messages = []
+    try:
+        session_doc = sessions_collection.find_one(
+            {'id': session_id}, {'_id': 0, 'messages': 1, 'topic_break_at': 1}
+        )
+        if session_doc and session_doc.get('messages'):
+            msgs = _filter_messages_after_topic_break(
+                session_doc['messages'], session_doc.get('topic_break_at')
+            )
+            # Exclude the user message we just saved (it goes in separately)
+            recent_messages = msgs[:-1][-4:]
+    except Exception as e:
+        logger.warning(f'Failed to load recent messages for planner: {e}')
+
+    attachments_meta = []
+    try:
+        attachments_meta = [
+            {'filename': a.get('filename')} for a in list_file_attachments(session_id)
+        ]
+    except Exception as e:
+        logger.warning(f'Failed to load attachments for planner: {e}')
+
+    plan = await plan_context(
+        user_message=content,
+        recent_messages=recent_messages,
+        attachments_meta=attachments_meta,
+        model=model,
+    )
+    yield json.dumps({'type': 'plan', 'data': plan})
+
+    reasoning_tracker.log_step(
+        thought='Context retrieval planned',
+        action='PLAN_CONTEXT',
+        source='planner',
+        confidence=0.9,
+        information=f'Web queries: {len(plan.get("web_queries") or [])}, '
+        f'files: {len(plan.get("relevant_files") or [])}, '
+        f'fallback: {plan.get("fallback", False)}',
+    )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Step 2b: Build augmented prompt
     # ─────────────────────────────────────────────────────────────────────
     system_prompt, final_prompt, context_meta = await build_prompt_with_memory(
         user_content=content,
         chat_sessionId=session_id,
+        plan=plan,
     )
     logger.info('Prompt built: %s chars', len(final_prompt), extra={'session_id': session_id})
 
@@ -1214,15 +1300,104 @@ async def stream_chat_reply(
     loaded_sources = context_meta.get('loaded_sources', {})
 
     # ─────────────────────────────────────────────────────────────────────
-    # Step 3: Generate answer and STREAM IMMEDIATELY
+    # Step 2c: Collect image attachments for vision
+    # Images are sent only when the planner asked for vision OR the user
+    # message arrived together with a newly uploaded image (first turn after
+    # upload). Images have no text extraction — the base64 data IS the context.
+    # ─────────────────────────────────────────────────────────────────────
+    images_to_send: list[str] = []
+    try:
+        image_atts = [a for a in list_file_attachments(session_id) if a.get('is_image')]
+        if image_atts:
+            last_prev_created = (
+                recent_messages[-1].get('created_at') if recent_messages else None
+            )
+            has_new_image = any(
+                a.get('uploaded_at')
+                and (last_prev_created is None or a['uploaded_at'] > last_prev_created)
+                for a in image_atts
+            )
+            if plan.get('needs_vision') or has_new_image:
+                for att in image_atts:
+                    full = get_file_attachment(att.get('id'))
+                    b64 = (full or {}).get('image_base64')
+                    if b64:
+                        images_to_send.append(b64)
+        if images_to_send:
+            logger.info(
+                'Including %s image(s) for vision (needs_vision=%s)',
+                len(images_to_send),
+                plan.get('needs_vision'),
+                extra={'session_id': session_id},
+            )
+    except Exception as e:
+        logger.warning(f'Failed to collect image attachments: {e}')
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Step 3a: REASONING PHASE FIRST (think before answering, if enabled)
+    # ─────────────────────────────────────────────────────────────────────
+    reasoning_text = ''
+
+    if reasoning_enabled:
+        yield json.dumps({'type': 'reasoning_starting', 'data': 'Thinking...'})
+
+        # Prepend the planner's decisions as the first reasoning content
+        # (server-side text, not a model call).
+        plan_summary = _format_plan_summary(plan)
+        reasoning_text += plan_summary
+        yield json.dumps({'type': 'reasoning_token', 'data': plan_summary})
+
+        thinking_prompt = _build_thinking_prompt(final_prompt)
+        logger.info('Generating think-first reasoning', extra={'session_id': session_id})
+        try:
+            async for token in stream_ollama(
+                prompt=thinking_prompt,
+                model=model,
+                system=(
+                    'You are an AI assistant thinking through a question before answering. '
+                    'Be clear, honest, and concise.'
+                ),
+                images=images_to_send or None,
+            ):
+                reasoning_text += token
+                yield json.dumps({'type': 'reasoning_token', 'data': token})
+
+            logger.info(
+                'Reasoning generated: %s chars',
+                len(reasoning_text),
+                extra={'session_id': session_id},
+            )
+        except Exception as e:
+            logger.error(f'Reasoning generation failed: {e}')
+            reasoning_text += '[Reasoning generation failed]'
+
+        reasoning_tracker.log_step(
+            thought='Generated think-first analysis before answering',
+            action='THINK_FIRST',
+            source='model',
+            confidence=0.9,
+            information=f'Reasoning length: {len(reasoning_text)} chars',
+        )
+    else:
+        logger.info('Reasoning generation skipped (disabled)', extra={'session_id': session_id})
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Step 3b: Generate answer and STREAM IMMEDIATELY
     # ─────────────────────────────────────────────────────────────────────
     assistant_answer = ''
 
+    answer_prompt = (
+        _build_answer_prompt_with_reasoning(final_prompt, reasoning_text)
+        if reasoning_enabled and reasoning_text.strip()
+        else final_prompt
+    )
+
     try:
         async for token in stream_ollama(
-            prompt=final_prompt,
+            prompt=answer_prompt,
             model=model,
             system=system_prompt,
+            images=images_to_send or None,
         ):
             assistant_answer += token
             # Stream live tokens to user immediately
@@ -1234,6 +1409,24 @@ async def stream_chat_reply(
 
         # Send signal that answer streaming is complete
         yield json.dumps({'type': 'answer_complete'})
+    except ProviderStreamError as e:
+        # Stream failed: notify caller and do NOT persist an assistant message.
+        # Non-vision models reject image input — surface a helpful message.
+        logger.error(f'Answer generation failed: {e}')
+        if images_to_send:
+            yield json.dumps(
+                {
+                    'type': 'error',
+                    'message': (
+                        'This model cannot view images — install a vision model '
+                        '(e.g. qwen2.5vl or gemma3:4b) from the Models page. '
+                        f'(Provider error: {e})'
+                    ),
+                }
+            )
+        else:
+            yield json.dumps({'type': 'error', 'message': f'Generation failed: {e}'})
+        return
     except Exception as e:
         # Stream failed: notify caller and do NOT persist an assistant message
         logger.error(f'Answer generation failed: {e}')
@@ -1322,52 +1515,7 @@ async def stream_chat_reply(
 
     logger.info('Answer verified after streaming', extra={'session_id': session_id})
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Step 6: Generate reasoning by asking the MODEL to explain itself (if enabled)
-    # ─────────────────────────────────────────────────────────────────────
-    reasoning_text = ''
-
-    if reasoning_enabled:
-        yield json.dumps({'type': 'reasoning_starting', 'data': 'Generating reasoning...'})
-
-        # Get follow-up information from metadata
-        is_follow_up = context_meta.get('is_follow_up', False)
-        primary_answer = _get_primary_assistant_answer(session_id) if is_follow_up else None
-
-        reasoning_prompt = _build_reasoning_prompt(
-            user_query=content,
-            assistant_answer=assistant_answer,
-            sources_used=sources,
-            loaded_sources=loaded_sources,
-            confidence=overall_confidence,
-            unverified_count=len(unverified),
-            guard_eval=guard_eval,
-            is_follow_up=is_follow_up,
-            primary_answer=primary_answer,
-        )
-
-        logger.info('Generating reasoning from model', extra={'session_id': session_id})
-        try:
-            async for token in stream_ollama(
-                prompt=reasoning_prompt,
-                model=model,
-                system='You are an AI assistant explaining your reasoning process. Be clear, honest, and concise.',
-            ):
-                reasoning_text += token
-                # Stream reasoning in real-time
-                yield json.dumps({'type': 'reasoning_token', 'data': token})
-
-            logger.info(
-                'Reasoning generated: %s chars',
-                len(reasoning_text),
-                extra={'session_id': session_id},
-            )
-        except Exception as e:
-            logger.error(f'Reasoning generation failed: {e}')
-            reasoning_text = '[Reasoning generation failed]'
-    else:
-        logger.info('Reasoning generation skipped (disabled)', extra={'session_id': session_id})
-
+    # Reasoning veto assessment (reasoning_text produced in the think-first phase)
     reasoning_veto = (
         assess_reasoning_veto(reasoning_text, overall_confidence, assistant_answer)
         if reasoning_enabled
@@ -1407,6 +1555,7 @@ async def stream_chat_reply(
     # Step 8: Save assistant message with FULL verification details
     # ─────────────────────────────────────────────────────────────────────
     assistant_msg = {
+        'id': str(uuid.uuid4()),  # stable id for semantic history vectors
         'role': 'assistant',
         'content': assistant_answer.strip(),
         'created_at': datetime.utcnow(),
@@ -1456,6 +1605,9 @@ async def stream_chat_reply(
         yield json.dumps({'type': 'error', 'message': f'Save failed: {e}'})
         return
 
+    # Embed the assistant message for semantic history (best effort)
+    await asyncio.to_thread(_index_message_vector, session_id, assistant_msg)
+
     # ─────────────────────────────────────────────────────────────────────
     # Step 9: Auto-memory
     # ─────────────────────────────────────────────────────────────────────
@@ -1489,6 +1641,7 @@ async def stream_chat_reply(
                 'source_used': 'combined',
                 'sources_used': list(sources.keys()),
                 'supplemented_with': list(sources.keys()),
+                'plan': plan,
                 'sources_considered': sources,
                 'source_relevance': context_meta.get('source_relevance', {}),
                 'loaded_sources': loaded_sources,

@@ -151,4 +151,12 @@ def delete_session(session_id: str) -> bool:
     delete_memories_for_session(session_id)
     delete_file_attachments_for_session(session_id)
 
+    # Delete semantic-history vectors (best effort)
+    try:
+        from app.vector import get_vector_store
+
+        get_vector_store('history').delete_by_session(session_id)
+    except Exception:
+        pass
+
     return True

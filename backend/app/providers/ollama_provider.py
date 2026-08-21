@@ -25,10 +25,17 @@ class OllamaProvider(LLMProvider):
         return 'ollama'
 
     async def stream_chat(
-        self, prompt: str, model: str, system: Optional[str] = None
+        self,
+        prompt: str,
+        model: str,
+        system: Optional[str] = None,
+        images: Optional[list[str]] = None,
     ) -> AsyncIterator[str]:
         """
-        Stream response from Ollama LLM token by token
+        Stream response from Ollama LLM token by token.
+
+        images: base64-encoded images (no 'data:' prefix), passed straight to
+        Ollama's native /api/generate vision support.
 
         """
         logger.info(
@@ -43,6 +50,9 @@ class OllamaProvider(LLMProvider):
                 if system:
                     payload['system'] = system
                     logger.info('Added system to payload')
+                if images:
+                    payload['images'] = images
+                    logger.info('Added %s image(s) to payload', len(images))
 
                 logger.info('Ollama stream payload keys: %s', list(payload.keys()))
                 if 'system' in payload:
@@ -81,7 +91,13 @@ class OllamaProvider(LLMProvider):
             logger.error('ollama stream request failed: %s', exc)
             raise ProviderStreamError(f'Ollama request failed: {exc}') from exc
 
-    async def generate_once(self, prompt: str, model: str, system: Optional[str] = None) -> str:
+    async def generate_once(
+        self,
+        prompt: str,
+        model: str,
+        system: Optional[str] = None,
+        json_schema: Optional[dict] = None,
+    ) -> str:
         """
         Get complete response from Ollama in one call (non-streaming)
 
@@ -92,6 +108,9 @@ class OllamaProvider(LLMProvider):
                 payload = {'model': model, 'prompt': prompt, 'stream': False}
                 if system:
                     payload['system'] = system
+                if json_schema:
+                    # Ollama structured outputs: constrained decoding to the schema
+                    payload['format'] = json_schema
 
                 # Make request
                 resp = await client.post(

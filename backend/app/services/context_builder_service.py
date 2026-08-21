@@ -193,7 +193,9 @@ def calculate_weighted_confidence(
     # Filter out contextual-only sources
     if factual_sources_only:
         factual_sources = {
-            k: v for k, v in sources_considered.items() if k not in {'history', 'follow-up'}
+            k: v
+            for k, v in sources_considered.items()
+            if k not in {'history', 'semantic_history', 'overview', 'follow-up'}
         }
 
         if not factual_sources:

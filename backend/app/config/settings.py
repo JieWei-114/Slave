@@ -42,8 +42,26 @@ class Settings(BaseSettings):
     VECTOR_STORE: str = 'mongo'
     QDRANT_URL: str = 'http://qdrant:6333'
     QDRANT_COLLECTION: str = 'slave_memories'
+    # Qdrant collection for conversation-history vectors (semantic history)
+    QDRANT_HISTORY_COLLECTION: str = 'slave_history'
     # Embedding dimension (all-MiniLM-L6-v2 = 384)
     EMBEDDING_DIM: int = 384
+
+    # SEMANTIC HISTORY SETTINGS
+    # Embed chat messages on save and retrieve older, semantically relevant
+    # messages beyond the recency window when the planner asks for them.
+    HISTORY_VECTOR_ENABLED: bool = True
+    # Max chars of message content embedded / stored in the history payload
+    HISTORY_VECTOR_CONTENT_MAX_CHARS: int = 1000
+    # Retrieval knobs
+    HISTORY_VECTOR_TOP_K: int = 4
+    HISTORY_VECTOR_THRESHOLD: float = 0.45
+    # Startup backfill bound (most recent messages across sessions)
+    HISTORY_VECTOR_BACKFILL_MAX: int = 2000
+
+    # VISION SETTINGS
+    # Max image upload size in MB (pre-base64-encode)
+    VISION_IMAGE_MAX_MB: int = 10
 
     # VOICE SETTINGS (local STT + TTS, privacy-first)
     VOICE_ENABLED: bool = True
@@ -82,8 +100,11 @@ class Settings(BaseSettings):
     # How many memories to search/retrieve (default for all contexts)
     MEMORY_SEARCH_LIMIT: int = 10
 
-    # Minimum similarity threshold for memory matching
-    MEMORY_SEARCH_THRESHOLD: float = 0.3
+    # Minimum similarity threshold for memory matching.
+    # NOTE: all-MiniLM scores short facts vs. questions in the 0.40-0.50
+    # band ("what is my name?" vs "my name is vey" = 0.47), so anything
+    # above ~0.4 silently drops valid personal memories.
+    MEMORY_SEARCH_THRESHOLD: float = 0.35
 
     # Max characters per memory item
     MEMORY_MAX_CHARS_PER_ITEM: int = 500
@@ -96,7 +117,7 @@ class Settings(BaseSettings):
 
     # --- CONVERSATION HISTORY LIMITS ---
     # How many recent messages to include
-    CHAT_HISTORY_LIMIT: int = 10
+    CHAT_HISTORY_LIMIT: int = 6
 
     # Max characters per message in history
     CHAT_HISTORY_MAX_CHARS_PER_MSG: int = 500
@@ -132,6 +153,11 @@ class Settings(BaseSettings):
 
     # --- FEATURES ---
     CHAT_ENABLE_RESULT_RANKING: bool = True
+
+    # Context planner: one small LLM call decides web queries, memory/history
+    # retrieval phrases and relevant files before context is built.
+    # When False, the static fallback plan is used (roughly the old behavior).
+    PLANNER_ENABLED: bool = True
 
     # --- API DEFAULTS ---
     # Default limits for API endpoints (can be overridden by query params)
@@ -208,9 +234,6 @@ class Settings(BaseSettings):
     CONFIDENCE_HISTORY: float = (
         0.0  # Conversation history (contextual only, not counted in confidence)
     )
-    CONFIDENCE_FOLLOW_UP: float = (
-        0.0  # Follow-up context (contextual only, not counted in confidence)
-    )
     CONFIDENCE_NONE: float = 0.3  # No context available
 
     # ============================================================
@@ -258,139 +281,24 @@ class Settings(BaseSettings):
     # SYSTEM INSTRUCTIONS
     # ============================================================
     CHAT_SYSTEM_INSTRUCTIONS: str = """
-SYSTEM INSTRUCTIONS:
-You are a helpful, reliable AI assistant capable of using multiple sources.
+You are a helpful local AI assistant.
 
-You must:
-- Always understand the user’s question before answering. 
-- Decide which sources (if any) are relevant.
-- Do NOT invent information.
-- Do NOT assume unavailable sources.
-
-Decide whether the question is:
-- a new question, or a follow-up question
-
-STEP 1: Clarify User Intent (ALWAYS FIRST)
-- Restate the user’s question in your own words.
-- Identify the user’s intent:
-- information, explanation, clarification, continuation or follow-up
-
-Rules:
-- Do not reference any source.
-- Do not answer the question in this step.
-
-STEP 2: Context Resolution (Follow-Up Handling)
-- Determine whether the current question is a follow-up.
-
-If the question is a follow-up:
-- Treat the previous assistant answer as the PRIMARY CONTEXT.
-- Resolve all pronouns and vague references against this primary context first.
-- Consider how the current question refers to that answer.
-- Decide whether the primary context alone is sufficient.
-- Do not introduce a new topic.
-
-If the question is not a follow-up:
-- Treat it as a standalone question.
-
-Vague References Rule
-- Follow-up mode: resolve to PRIMARY CONTEXT
-- Non-follow-up: resolve to the most recent relevant mention in conversation history
-- If still ambiguous: ask the user to clarify
-- Follow-up content is contextual, not factual by itself.
-
-STEP 3: Source Eligibility Gate
-Based on intent and context resolution, evaluate each source:
-- FILES
-- MEMORY
-- CONVERSATION HISTORY
-- WEB
-
-For each source, mark it as:
-- REQUIRED
-- OPTIONAL
-- NOT USED
-
-Rules:
-If any REQUIRED source is missing or unavailable:
-- Clearly state that the question cannot be fully answered.
-- Do not retrieve, analyze, or infer from other sources yet.
-- Do not assume a source exists unless it is confirmed.
-
-STEP 4: Source Reasoning (ONLY FOR ELIGIBLE SOURCES)
-For each source marked REQUIRED or OPTIONAL, specify:
-SOURCE: FILE / MEMORY / HISTORY / WEB
-INTENDED USE: factual grounding / support / continuity
-EXPECTED CONTRIBUTION: what this source should provide
-LIMITATION: what this source cannot guarantee
-
-Rules:
-- Do not fabricate findings.
-- If no concrete information is available, state that explicitly.
-
-SOURCE USAGE RULES & PRIORITY
-1. FILES (Highest Priority)
-- Always read available file content each turn.
-- Files are authoritative primary sources.
-- If file content conflicts with memory or web, FILES take priority.
-- Use file content to answer the user’s question, not just summarize it.
-
-2. PRIMARY CONTEXT (Follow-Up Mode Only)
-- The previous assistant answer is the primary reference.
-- Resolve all references against it first.
-- History, memory, and web are secondary in follow-up mode.
-
-3. CONVERSATION HISTORY
-Non-follow-up mode: important for understanding context.
-Follow-up mode: background only.
-- Use strictly to maintain coherence when primary context is insufficient.
-- If the required information cannot be resolved from PRIMARY CONTEXT, use conversation history strictly as a reference to maintain coherence.
-
-4. MEMORY (Categorized Long-Term Knowledge)
-- Memory entries are categorized as: preference/fact, important, other.
-- important memories MUST be read every time and treated as high-priority context.
-- preference and fact memories should be used for long-term consistency and personalization.
-- other memories are optional and should only be used if clearly relevant.
-Does not contain:
-- temporary context (use history)
-- real-time information (use web)
-- If memory conflicts with fresh web data, prefer web.
-
-5. WEB SEARCH
-- Used for verification and up-to-date information.
-- Considered supporting, not authoritative over files.
-- Prefer recent and authoritative sources.
-
-When citing:
-“According to [SOURCE], …”
-
-STEP 5: Answer Construction Plan
-Before answering, determine:
-- What can be answered directly and confidently
-- What requires uncertainty, qualification, or clarification
-- What information is missing or unverifiable
-- What is the primary source of truth (if any)
-
-FINAL RESPONSE RULES
-Before responding, verify:
-- Am I answering the actual user question?
-- Did I avoid using missing, disallowed, or assumed sources?
-- Are all assumptions explicitly stated?
-- Do I need to ask for clarification before answering?
-
-When information is complete:
-- Answer clearly and confidently.
-
-When information is incomplete or uncertain:
-- You are allow to say “I’m not sure yet” or “This cannot be fully determined.”
-- Explain what information is missing.
-- Ask for additional information only if necessary.
-- Do not guess or assume.
-- Do not answer if grounding is insufficient.
-
-HARD CONSTRAINTS (NON-NEGOTIABLE)
-- Do not assume a file exists unless it was successfully read.
-- Do not invent information under any circumstance.
-
+- Answer the user's question naturally and directly.
+- The prompt may include context sections (UPLOADED FILE, CONVERSATION HISTORY,
+  WEB SEARCH RESULTS, RELEVANT MEMORIES, CONVERSATION OVERVIEW). Use them when
+  they are relevant; ignore them when they are not.
+- Uploaded files are the most authoritative source, then memories, then web
+  results. Conversation history is for continuity, not facts.
+- RELEVANT MEMORIES are facts the user explicitly saved. They OVERRIDE
+  conversation history: if an earlier assistant reply contradicts a memory
+  (e.g. it said "I don't know" before the memory was saved), trust the
+  memory and answer from it.
+- When you rely on a context section, cite the source name inline, e.g.
+  "According to report.pdf, ..." or "According to web search results, ...".
+- If the answer is not in the context and you are not confident, say you
+  don't know instead of guessing.
+- Never invent file contents, URLs, or citations.
+- Respond in the same language the user writes in.
 """.strip()
 
     class Config:

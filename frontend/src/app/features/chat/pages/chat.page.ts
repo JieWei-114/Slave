@@ -68,10 +68,15 @@ export class ChatPage implements OnInit, AfterViewInit, OnDestroy {
   /** Whether the topic-break divider is expanded to show the stored summary */
   showTopicSummary = signal(false);
   selectedFileName = signal('');
+  /** Object URL for a small thumbnail preview when the selected file is an image */
+  imagePreviewUrl = signal('');
   fileError = signal('');
   isFileUploading = signal(false);
   private fileContent = signal('');
   private pendingFile: File | null = null;
+
+  /** Image extensions accepted for upload (backend returns is_image for these) */
+  private static readonly IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp', '.gif'];
 
   // Voice input (speech-to-text) state
   isRecording = signal(false);
@@ -251,7 +256,11 @@ export class ChatPage implements OnInit, AfterViewInit, OnDestroy {
 
   /** Tooltip for the mic button, aware of model readiness and downloads */
   get micTitle(): string {
-    if (this.isTranscribing() && this.voiceDownloadHint()) return 'Downloading voice model…';
+    if (this.isTranscribing() && this.voiceDownloadHint()) {
+      // Only claim "downloading" when the model genuinely wasn't cached;
+      // otherwise a slow CPU transcription would show a misleading message.
+      return this.voiceApi.sttReady() ? 'Transcribing…' : 'Downloading voice model…';
+    }
     if (this.isRecording()) return 'Stop recording';
     if (!this.voiceApi.sttReady()) return 'First use will download the voice model (~30s)';
     return 'Record voice message';
@@ -286,6 +295,7 @@ export class ChatPage implements OnInit, AfterViewInit, OnDestroy {
     }
     this.releaseMicrophone();
     this.isRecording.set(false);
+    this.revokeImagePreview();
   }
 
   /**
@@ -337,7 +347,13 @@ export class ChatPage implements OnInit, AfterViewInit, OnDestroy {
       next: (data: AIModel[]) => {
         const list = data ?? [];
         this.models.set(list);
+        this.store.availableModels.set(list);
         this.noModelsInstalled.set(list.length === 0);
+        // If the selected model isn't actually installed, snap to the
+        // first installed one so sending never 404s on the provider.
+        if (list.length > 0 && !list.some((m) => m.id === this.store.currentModel().id)) {
+          this.store.setModel(list[0]);
+        }
       },
       error: () => {
         console.warn('Failed to load models from API, using defaults');
@@ -403,6 +419,7 @@ export class ChatPage implements OnInit, AfterViewInit, OnDestroy {
     this.fileContent.set('');
     this.fileError.set('');
     this.pendingFile = null;
+    this.revokeImagePreview();
   }
 
   /**
@@ -467,14 +484,28 @@ export class ChatPage implements OnInit, AfterViewInit, OnDestroy {
       return;
     }
 
+    // Check if image file (uploaded to backend, previewed as a thumbnail)
+    const isImage =
+      file.type.startsWith('image/') ||
+      ChatPage.IMAGE_EXTENSIONS.some((ext) => file.name.toLowerCase().endsWith(ext));
+
     // Check if binary file (requires server-side extraction)
     const isBinary = this.config.binaryExtensions.some((ext: any) =>
       file.name.toLowerCase().endsWith(ext),
     );
 
     this.isFileUploading.set(true);
+    this.revokeImagePreview();
 
-    if (isBinary) {
+    if (isImage) {
+      // Defer image upload until Send; show a thumbnail preview meanwhile
+      this.pendingFile = file;
+      this.selectedFileName.set(file.name);
+      this.fileContent.set('');
+      this.imagePreviewUrl.set(URL.createObjectURL(file));
+      this.isFileUploading.set(false);
+      input.value = '';
+    } else if (isBinary) {
       // Defer binary file upload until Send
       this.pendingFile = file;
       this.selectedFileName.set(file.name);
@@ -522,6 +553,7 @@ export class ChatPage implements OnInit, AfterViewInit, OnDestroy {
     return this.http.post<{
       content: string;
       filename: string;
+      is_image?: boolean;
     }>(`${this.config.apiBaseUrl}/chat/upload`, formData);
   }
 
@@ -560,6 +592,16 @@ export class ChatPage implements OnInit, AfterViewInit, OnDestroy {
     this.fileError.set('');
     this.isFileUploading.set(false);
     this.pendingFile = null;
+    this.revokeImagePreview();
+  }
+
+  /** Release the thumbnail object URL (removal / send / destroy) */
+  private revokeImagePreview(): void {
+    const url = this.imagePreviewUrl();
+    if (url) {
+      URL.revokeObjectURL(url);
+      this.imagePreviewUrl.set('');
+    }
   }
 
   isLastUserMessage(msg: any, index: number): boolean {

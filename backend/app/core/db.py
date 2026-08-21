@@ -47,6 +47,9 @@ tavily_quota_collection = db['tavily_quota']
 synthesized_memory_collection = db['synthesized_memory']
 file_attachments_collection = db['file_attachments']
 
+# Conversation-history message vectors (semantic history, mongo vector store)
+message_vectors_collection = db['message_vectors']
+
 """
 Index Creation
 
@@ -60,6 +63,10 @@ try:
     # File attachments indexes for expiration and retrieval
     file_attachments_collection.create_index([('session_id', 1), ('expires_at', 1)])
     file_attachments_collection.create_index([('session_id', 1), ('uploaded_at', -1)])
+
+    # Message vector indexes for semantic history lookup
+    message_vectors_collection.create_index([('id', 1)], unique=True)
+    message_vectors_collection.create_index([('session_id', 1), ('created_at', -1)])
 
     logger.info('Database indexes created successfully')
 except Exception as e:

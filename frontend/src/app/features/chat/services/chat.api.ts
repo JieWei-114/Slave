@@ -95,6 +95,7 @@ export class ChatApi {
     onVerification?: (status: { type: string; data?: any }) => void,
     reasoningEnabled = false,
     onError?: (err: unknown) => void,
+    onPlan?: (plan: any) => void,
   ): () => void {
     const url = `${this.config.apiBaseUrl}/chat/${sessionId}/stream`;
     const controller = new AbortController();
@@ -128,6 +129,16 @@ export class ChatApi {
         case 'reasoning_starting':
           onVerification?.({ type, data: data ? JSON.parse(data) : undefined });
           break;
+        case 'planning':
+          // Planner started — no payload of interest yet
+          break;
+        case 'plan': {
+          if (onPlan) {
+            const payload = data ? JSON.parse(data) : {};
+            if (payload.data) onPlan(payload.data);
+          }
+          break;
+        }
         case 'reasoning_token':
           onReasoning(JSON.parse(data));
           break;

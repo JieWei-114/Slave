@@ -179,6 +179,8 @@ def store_file_attachment(
     filename: str,
     content: str,
     file_type: str,
+    is_image: bool = False,
+    image_base64: str | None = None,
 ) -> dict:
     # Store an uploaded file attachment to database
     if len(content) > settings.FILE_ATTACHMENT_MAX_CHARS:
@@ -195,9 +197,12 @@ def store_file_attachment(
         'size_bytes': len(content.encode()),
         'size_chars': len(content),
         'content': content,
+        'is_image': is_image,
         'uploaded_at': datetime.utcnow(),
         'expires_at': expires_at,
     }
+    if is_image and image_base64:
+        file_attachment['image_base64'] = image_base64
 
     result = file_attachments_collection.insert_one(file_attachment)
     file_attachment['_id'] = result.inserted_id
@@ -211,10 +216,10 @@ def get_file_attachment(file_id: str) -> dict | None:
 
 
 def list_file_attachments(session_id: str) -> list[dict]:
-    # List file attachments for a session (without content)
+    # List file attachments for a session (without content / image data)
     cursor = file_attachments_collection.find(
         {'session_id': session_id},
-        {'_id': 0, 'content': 0},
+        {'_id': 0, 'content': 0, 'image_base64': 0},
     ).sort('uploaded_at', -1)
     return list(cursor)
 

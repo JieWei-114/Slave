@@ -15,7 +15,7 @@ export type ChatRole = 'user' | 'assistant';
  * Matches backend MessageMetadata model
  */
 export interface MessageMetadata {
-  source_used?: string; // Actual source used (combined, follow-up, memory, file, history, web)
+  source_used?: string; // Actual source used (combined, memory, file, history, web)
   sources_considered?: Record<string, number>; // All sources evaluated with scores
   source_relevance?: Record<string, number>; // Source relevance scores
   confidence?: number; // Overall confidence (deprecated, use confidence_final)
@@ -30,7 +30,6 @@ export interface MessageMetadata {
     memory?: { available: boolean; count: number };
     web?: { available: boolean; count: number };
     history?: { available: boolean };
-    follow_up?: { available: boolean };
   };
 
   // Confidence tracking
@@ -40,6 +39,7 @@ export interface MessageMetadata {
   // Validation metadata
   reasoning?: string; // Raw LLM-generated reasoning explanation
   reasoning_streaming?: boolean; // UI-only flag while reasoning tokens stream
+  plan?: PlanInfo; // Retrieval plan emitted by the planner during streaming
   reasoning_chain?: ReasoningChainSummary; // Structured reasoning steps
   reasoning_veto?: {
     level: string; // 'hard', 'soft', or 'none'
@@ -57,6 +57,18 @@ export interface MessageMetadata {
     reason: string; // Why they conflict
     confidence_reduction?: number; // How much confidence was reduced
   }[];
+}
+
+/**
+ * Retrieval plan emitted by the backend planner during streaming
+ * (SSE `plan` event)
+ */
+export interface PlanInfo {
+  web_queries?: string[];
+  history_query?: string;
+  memory_query?: string;
+  relevant_files?: string[];
+  needs_vision?: boolean;
 }
 
 /**

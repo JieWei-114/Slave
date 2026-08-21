@@ -21,9 +21,16 @@ logger = logging.getLogger(__name__)
 class QdrantVectorStore(VectorStore):
     """Vector store backed by Qdrant"""
 
-    def __init__(self):
+    def __init__(self, collection: Optional[str] = None, filter_flags: bool = True):
+        """
+        collection: Qdrant collection name (default: settings.QDRANT_COLLECTION).
+        filter_flags: when True, searches only enabled/non-deprecated points
+        (memory semantics). History vectors have no such flags -> False.
+
+        """
         self._client = QdrantClient(url=settings.QDRANT_URL)
-        self._collection = settings.QDRANT_COLLECTION
+        self._collection = collection or settings.QDRANT_COLLECTION
+        self._filter_flags = filter_flags
         self._ensured = False
 
     def _ensure_collection(self) -> None:
@@ -45,13 +52,16 @@ class QdrantVectorStore(VectorStore):
             )
         self._ensured = True
 
-    @staticmethod
-    def _build_filter(filter: Optional[dict] = None) -> qmodels.Filter:
-        # Only enabled, non-deprecated memories are searchable
-        must = [
-            qmodels.FieldCondition(key='enabled', match=qmodels.MatchValue(value=True)),
-            qmodels.FieldCondition(key='is_deprecated', match=qmodels.MatchValue(value=False)),
-        ]
+    def _build_filter(self, filter: Optional[dict] = None) -> qmodels.Filter:
+        # Only enabled, non-deprecated memories are searchable (memory namespace)
+        must = []
+        if self._filter_flags:
+            must = [
+                qmodels.FieldCondition(key='enabled', match=qmodels.MatchValue(value=True)),
+                qmodels.FieldCondition(
+                    key='is_deprecated', match=qmodels.MatchValue(value=False)
+                ),
+            ]
         if filter and filter.get('session_id'):
             must.append(
                 qmodels.FieldCondition(
@@ -82,6 +92,19 @@ class QdrantVectorStore(VectorStore):
             {'id': str(hit.id), 'score': float(hit.score), 'payload': hit.payload or {}}
             for hit in hits
         ]
+
+    def existing_ids(self, ids: list[str]) -> set[str]:
+        """Return the subset of ids already stored (used by history backfill)."""
+        if not ids:
+            return set()
+        self._ensure_collection()
+        points = self._client.retrieve(
+            collection_name=self._collection,
+            ids=ids,
+            with_payload=False,
+            with_vectors=False,
+        )
+        return {str(p.id) for p in points}
 
     def delete(self, id: str) -> None:
         self._ensure_collection()
